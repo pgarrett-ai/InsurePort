@@ -1,0 +1,31 @@
+# private: plans, research notes, handoffs, prompts (public repo = product only)
+/docs/
+/research/
+/archive/
+.claude/
+CLAUDE.md
+.superpowers/
+.obsidian/
+
+# secrets, env, data cache
+.env
+.env.*
+!.env.example
+/data/
+.venv/
+venv/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+
+# os / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
