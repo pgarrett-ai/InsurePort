@@ -13,8 +13,9 @@ pass-through (expiries move with offset rolls), rolls before the first usable pr
 a NaN input day on a quiet day and on a crash expiry (model inputs carried, spot not) and a
 partial-pillar day (not a fallback), the expiry-week return-rounding limit, cash accrual and the
 rates, dividends, VIX pillars and smile knobs reaching the pricer, the term-structure back-fill, a
-delta-targeted strike, spec validation, the T-bill sleeve, the par-bond proxy, long/flat
-time-series momentum and the build time of a Universa-like sleeve on a 9,000-day panel.
+delta-targeted strike, z_cap reaching the quotes and the delta strike, spec validation, the T-bill
+sleeve, the par-bond proxy, long/flat time-series momentum and the build time of a Universa-like
+sleeve on a 9,000-day panel.
 
 Why: every option-based safe haven in the backtests is one of these return series, so the
 accounting (what is paid, when, at which quote) is pinned to values recomputed here from
@@ -48,7 +49,7 @@ def _panel(periods: int = 260, start: str = "2019-01-01", **cols) -> pd.DataFram
 def _quote(leg: dict, t: pd.Timestamp, S: float = S0, vols: tuple = (20.0,) * 4, rf: float = 0.0, q: float = 0.0,
            **kw) -> tuple:
     """(mid, bid, ask) of an attrs["legs"] entry on date t: SKEW 130, VIX pillars `vols` (vix9d, vix,
-    vix3m, vix6m), r = ln(1 + rf), q; kw (m, nu, h) passed to pricing.quote."""
+    vix3m, vix6m), r = ln(1 + rf), q; kw (m, nu, h, z_cap) passed to pricing.quote."""
     T = (leg["expiry"] - t).days / 365
     return pricing.quote(S, leg["K"], T, pricing.var_swap_vol(T, *vols), 130.0, np.log1p(rf), q, leg["cp"], **kw)
 
@@ -404,6 +405,17 @@ def test_delta_leg_strike():
     g = df.attrs["legs"][0]
     T = (g["expiry"] - g["open_date"]).days / 365
     assert g["K"] == pytest.approx(pricing.strike_for_delta(S0, T, 0.2, 130.0, 0.0, 0.0, 0.05, "P"), rel=1e-12)
+
+
+def test_z_cap_reaches_quotes_and_delta_strikes():
+    mkt = _panel(periods=30)
+    g = sleeves.option_sleeve(mkt, OptionSpec((PUT25,)), z_cap=2.5).attrs["legs"][0]  # z ~ 5: beyond either cap
+    assert g["unit_cost"] == pytest.approx(_quote(g, g["open_date"], z_cap=2.5)[2], rel=1e-12)
+    assert g["unit_cost"] != pytest.approx(_quote(g, g["open_date"])[2], rel=1e-3)
+    d = sleeves.option_sleeve(mkt, OptionSpec((Leg("P", delta=0.01),)), z_cap=2.5).attrs["legs"][0]
+    T = (d["expiry"] - d["open_date"]).days / 365
+    K = pricing.strike_for_delta(S0, T, 0.2, 130.0, 0.0, 0.0, 0.01, "P", z_cap=2.5)
+    assert d["K"] == pytest.approx(K, rel=1e-12)
 
 
 @pytest.mark.parametrize(

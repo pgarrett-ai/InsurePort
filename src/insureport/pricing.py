@@ -24,7 +24,7 @@ from scipy.optimize import brentq
 from scipy.special import erfcx
 from scipy.stats import norm
 
-SKEW_MULT: float = 0.5  # placeholder prior (spec: 0.3-0.7); slice 5 calibrates it on PPUT and overwrites it
+SKEW_MULT: float = 0.3  # calibrated on PPUT 1990-2015 (scripts/calibrate.py; replicate.calibrate_skew)
 HALF_SPREAD_MIN: float = 0.05  # SPX index points (the minimum tick)
 PILLARS_DAYS = (9, 30, 93, 184)  # VIX9D, VIX, VIX3M, VIX6M (Cboe's target tenors; VIX6M is 184 d)
 Z_CAP: float = 3.0  # put wing flat beyond this many standard deviations of standardized moneyness

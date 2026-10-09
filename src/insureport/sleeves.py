@@ -145,14 +145,15 @@ def _settle_row(day: np.ndarray, expiry: np.ndarray) -> np.ndarray:
 
 def _quotes(
     px: dict[str, np.ndarray], day: np.ndarray, K: np.ndarray, expiry: np.ndarray, call: np.ndarray,
-    *, m: float, nu: float, h: float,
+    *, m: float, nu: float, h: float, z_cap: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """(mid, bid, ask) in index points, elementwise: option (K, expiry, call) on panel row `day`.
 
-    The model branch: pricing.quote at the row's S, T = (expiry - date)/365 and the vols, skew,
-    r, q of the last usable row (_inputs `eff`: the row itself unless its inputs are unusable),
-    vs = var_swap_vol(T, VIX pillars). From the settle row (_settle_row) on, T = 0: the mid is the
-    intrinsic value on the settle row's close, frozen. Slice 9 adds the real-chain lookup here.
+    The model branch: pricing.quote (m, nu, h, z_cap passed on) at the row's S, T = (expiry -
+    date)/365 and the vols, skew, r, q of the last usable row (_inputs `eff`: the row itself
+    unless its inputs are unusable), vs = var_swap_vol(T, VIX pillars). From the settle row
+    (_settle_row) on, T = 0: the mid is the intrinsic value on the settle row's close, frozen.
+    Slice 9 adds the real-chain lookup here.
     """
     # ponytail: PM settlement at the close, continuous strikes
     settle = _settle_row(px["day"], expiry)
@@ -166,13 +167,15 @@ def _quotes(
         if sel.any():
             r = row[sel]
             out[:, sel] = pricing.quote(
-                px["spx"][d[sel]], K[sel], T[sel], vs[sel], px["skew"][r], px["r"][r], px["q"][r], cp, m=m, nu=nu, h=h
+                px["spx"][d[sel]], K[sel], T[sel], vs[sel], px["skew"][r], px["r"][r], px["q"][r], cp,
+                m=m, nu=nu, h=h, z_cap=z_cap,
             )
     return out[0], out[1], out[2]
 
 
 def _open_legs(
-    px: dict[str, np.ndarray], opens: list[tuple[int, Leg, int]], offset: int, *, m: float, nu: float, h: float
+    px: dict[str, np.ndarray], opens: list[tuple[int, Leg, int]], offset: int, *, m: float, nu: float, h: float,
+    z_cap: float,
 ) -> list[dict]:
     """New legs from (open row, Leg, scheduled close row; len(panel) = past the data).
 
@@ -205,7 +208,7 @@ def _open_legs(
             T = (expiry - day[t]).astype(float) / 365
             vs = float(pricing.var_swap_vol(T, *(px[c][row] for c in _VOLS)))
             args = (S, T, vs, px["skew"][row], px["r"][row], px["q"][row])
-            K = pricing.strike_for_delta(*args, L.delta, L.cp, m=m, nu=nu)
+            K = pricing.strike_for_delta(*args, L.delta, L.cp, m=m, nu=nu, z_cap=z_cap)
         settle = int(_settle_row(px["day"], expiry))
         legs.append({"leg": L, "open": t, "close": close, "K": float(K), "expiry": expiry, "settle": settle,
                      "n": 0.0, "closed_on": None, "reason": None})
@@ -215,7 +218,7 @@ def _open_legs(
     expiry = np.repeat(np.array([g["expiry"] for g in legs]), lens)
     call = np.repeat([g["leg"].cp == "C" for g in legs], lens)
     cuts = np.cumsum(lens)[:-1]
-    quotes = (np.split(a, cuts) for a in _quotes(px, day, K, expiry, call, m=m, nu=nu, h=h))
+    quotes = (np.split(a, cuts) for a in _quotes(px, day, K, expiry, call, m=m, nu=nu, h=h, z_cap=z_cap))
     for g, mid, bid, ask in zip(legs, *quotes):
         g["mid"], g["bid"], g["ask"] = mid, bid, ask
         g["unit_cost"] = float(ask[0] if g["leg"].qty > 0 else bid[0])
@@ -241,6 +244,7 @@ def option_sleeve(
     nu: float = 1.0,
     h: float = 0.05,
     offset_bdays: int = 0,
+    z_cap: float = pricing.Z_CAP,
 ) -> pd.DataFrame:
     """Daily returns of a rolled synthetic-SPX-option sleeve, per unit of sleeve capital.
 
@@ -257,9 +261,10 @@ def option_sleeve(
 
     State: cash C (grows by 1 + rf_{t-1} days/360), stock A (overlay; grows with `underlying`,
     default spxtr.pct_change()), legs n_j (signed index units). NAV = A + C + sum n_j mid_j.
-    Quotes from pricing.quote (m, nu, h passed on), via _quotes: marks at mid; opens at the ask
-    (long) / bid (short); closes before expiry at the bid (long) / ask (short); from the last
-    trading day on or before expiry the leg is worth intrinsic on that day's close.
+    Quotes from pricing.quote via _quotes (m, nu, h, z_cap passed on; m, nu, z_cap also to
+    strike_for_delta): marks at mid; opens at the ask (long) / bid (short); closes before expiry
+    at the bid (long) / ask (short); from the last trading day on or before expiry the leg is
+    worth intrinsic on that day's close.
     At a roll on row t: (1) close the legs due, proceeds to C, then monetize the legs held over
     the roll if they qualify (below); (2) NAV_pre, ret_t = NAV_pre / NAV_{t-1} - 1;
     (3) NAV_pre <= WIPED_OUT x NAV_post of the previous event (start: 1): ret_t = -1 exactly and
@@ -300,7 +305,7 @@ def option_sleeve(
     _check(spec)
     if "ts_filled" not in mkt:
         mkt = pricing.fill_term_structure(mkt)
-    px, n, kw = _inputs(mkt), len(mkt), {"m": m, "nu": nu, "h": h}
+    px, n, kw = _inputs(mkt), len(mkt), {"m": m, "nu": nu, "h": h, "z_cap": z_cap}
     premium = spec.mode == "premium"
     ev = mkt.index.get_indexer(roll_dates(mkt.index, spec.roll_every_months, offset_bdays))
     ev = ev[px["eff"][ev] >= 0].tolist()

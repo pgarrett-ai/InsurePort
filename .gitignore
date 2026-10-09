@@ -29,3 +29,6 @@ dist/
 Thumbs.db
 .vscode/
 .idea/
+
+# plotly html figures are regenerated; only png is committed
+figures/*.html
