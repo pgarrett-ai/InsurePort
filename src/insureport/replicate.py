@@ -215,10 +215,12 @@ def calibrate_skew(
 
     The panel is cut at train_end before anything runs (the term-structure back-fill included),
     so nothing later leaks in. Columns: te, dcagr, corr (tracking over the whole training panel),
-    cap_share (share of training days whose SKEW puts m gamma / 6 above the pricer's slope cap
-    c_max at nu 1 and Z_CAP, where m stops moving prices: the m objective is identified by the
-    other days) and best: the lowest te among the m with |dcagr| <= TOLERANCE["PPUT"]["dcagr"]
-    (the lowest te overall when none qualifies), ties to the smaller |dcagr|.
+    cap_share (share of training days with SKEW and VIX whose m gamma / 6 is above the pricer's
+    slope cap for a 30-day option at that day's VIX, pricing._slope_cap at nu 1 and Z_CAP, where m
+    stops moving prices: the m objective is identified by the other days; the cap tightens as T
+    falls, so later in each PPUT month it binds more often) and best: the lowest te among the m
+    with |dcagr| <= TOLERANCE["PPUT"]["dcagr"] (the lowest te overall when none qualifies), ties to
+    the smaller |dcagr|.
     Why not te alone: m sets the premium level, which te (a demeaned std) barely sees. On PPUT
     1990-2015 te falls steadily but only 0.19 pp across the grid (2.08% at m 0.2 to 1.89% at 1.0)
     while dcagr falls 3 pp (0.0% to -3.0%/yr), so te alone picks the grid edge m 1 with a price
@@ -227,12 +229,12 @@ def calibrate_skew(
     budget). argmin |dcagr| would give m 0.2.
     """
     train = mkt.loc[:train_end]
-    c_max = pricing._max_slope(1.0, pricing.Z_CAP)
-    skew = train["skew"].dropna()
+    days = train[["skew", "vix"]].dropna()
+    c_max = pricing._slope_cap(30 / 365, days["vix"] / 100, 1.0, pricing.Z_CAP)
     rows = {}
     for m in m_grid:
         t = tracking(replicate(train, "PPUT", m=m, h=h), train["pput"], train["spxtr"])
-        cap = float((pricing.skew_slope(skew, m) > c_max).mean())
+        cap = float((pricing.skew_slope(days["skew"], m) > c_max).mean())
         rows[float(m)] = {"te": t["te"], "dcagr": t["dcagr"], "corr": t["corr"], "cap_share": cap}
     out = pd.DataFrame.from_dict(rows, orient="index").rename_axis("m")
     ok = out["dcagr"].abs() <= TOLERANCE["PPUT"]["dcagr"]

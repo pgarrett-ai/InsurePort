@@ -26,7 +26,7 @@ from insureport import pricing
 from insureport.portfolio import cash_returns
 
 WIPED_OUT = 1e-12  # a sleeve left with this fraction of its NAV at the previous event restarts from unit capital
-_VOLS = ("vix9d", "vix", "vix3m", "vix6m")
+_VOLS = ("vix9d", "vix", "vix3m", "vix6m", "vix1y")  # pricing.var_swap_vol pillars, in order
 
 
 @dataclass(frozen=True)
@@ -338,10 +338,12 @@ def option_sleeve(
                 hits = np.flatnonzero(_cashed_in(held, val, spec.monetize_mult))
                 cut = hits[0] if len(hits) else cut
             days, navs = days[:cut], navs[:cut]
-            # ponytail: ret is a double. For a far-OTM put held to expiry at f ~ 1 the mark falls below 1e-16 of
-            # the day before in the last ~4 trading days at VIX <= 15, ret rounds to -1, and a gain or crash payoff
-            # in expiry week is lost to compounding (test_expiry_week_payoff_is_lost_to_return_rounding). Add a NAV
-            # column (or have the engine read sleeve NAV levels) if hold-to-expiry premium presets are used.
+            # ponytail: ret is a double. Under a flat or near-flat put wing a far-OTM put held to expiry at f ~ 1
+            # marks below 1e-16 of the day before in the last ~4 trading days at VIX <= 15, ret rounds to -1, and a
+            # gain or crash payoff in expiry week is lost to compounding (test_expiry_week_payoff_is_lost_to_return_
+            # rounding). The default linear wing (m 0.3) keeps such marks alive at SKEW >~ 106; a finite z_cap or a
+            # near-flat smile (SKEW <~ 105, as in 1996-97) still rounds ret to -1. Add a NAV column (or have the
+            # engine read sleeve NAV levels) if hold-to-expiry premium presets are used.
             with np.errstate(divide="ignore", invalid="ignore"):
                 base = np.r_[nav, navs[:-1]]
                 ret[days] = np.where(base > 0, navs / base - 1, 0.0)  # no capital, no return

@@ -1,8 +1,9 @@
 """Tests for insureport.data: the Cboe and FRED CSV parsers, the parquet cache (fresh hit,
 20 h refresh, stale fallback, empty fallback, duplicate dates, corrupt file, unwritable dir),
 the network seams (offline guard, request headers, yfinance call and post-processing), prices()
-normalising and dropping tickers, and load_market() panel assembly (calendar, source mapping, ffill limit, rf scaling, the
-dividend yield q with its clip and TR gaps, required-series errors).
+normalising and dropping tickers, load_market() panel assembly (calendar, source mapping incl. the
+VIX1Y pillar, ffill limit, rf scaling, the dividend yield q with its clip and TR gaps, required-series
+errors) and the committed fixture's columns.
 
 Why: every later module trusts this panel. All network I/O goes through the two seams
 (_yf_download, _http_text), which are monkeypatched here with synthetic series, so the
@@ -247,6 +248,7 @@ CBOE = {
     "VIX": pd.concat([VIX, SAT]),
     "VIX9D": pd.Series(19.0, IDX[300:]),  # starts late, like the real VIX9D
     "VIX6M": pd.Series(23.0, IDX),
+    "VIX1Y": pd.Series(24.0, IDX[250:]),  # starts late, like the real VIX1Y (2007)
     "SKEW": pd.concat([pd.Series(120.0, IDX), SAT]),
     "PPUT": pd.Series(500.0, IDX),
     "CLL": pd.Series(400.0, IDX),
@@ -277,13 +279,16 @@ def _fake_sources(
 def test_load_market_panel(tmp_path, monkeypatch):
     _fake_sources(monkeypatch, tmp_path)
     m = data.load_market("1999-01-01")
-    assert list(m.columns) == ["spx", "spxtr", "vix", "vix9d", "vix3m", "vix6m", "skew", "rf", "q", "pput", "cll", "vxth"]
+    assert list(m.columns) == [
+        "spx", "spxtr", "vix", "vix9d", "vix3m", "vix6m", "vix1y", "skew", "rf", "q", "pput", "cll", "vxth"
+    ]
     assert m.index.equals(IDX)  # ^GSPC days only: Saturday VIX, SKEW, TR and DTB3 prints add no row
     assert np.allclose(m["spx"], PX)
     # each column comes from its own source (m.skew would be the DataFrame method, hence item access)
     assert (m["vix3m"] == 22).all() and (m["vix6m"] == 23).all() and (m["skew"] == 120).all()
     assert (m["pput"] == 500).all() and (m["cll"] == 400).all()
     assert m["vix9d"].iloc[:300].isna().all() and (m["vix9d"].iloc[300:] == 19).all()
+    assert m["vix1y"].iloc[:250].isna().all() and (m["vix1y"].iloc[250:] == 24).all()  # Cboe VIX1Y, its own source
     # ffill(limit=5): rows 200..204 carry row 199, row 205 stays NaN
     assert (m["vix"].iloc[200:205] == VIX.iloc[199]).all()
     assert np.isnan(m["vix"].iloc[205]) and m["vix"].iloc[206] == VIX[IDX[206]]
@@ -299,6 +304,7 @@ def test_load_market_panel(tmp_path, monkeypatch):
         "spxtr: 100 of 600 rows missing (data from 2000-05-22)",  # TR starts at IDX[100]
         "vix: 1 of 600 rows missing (data from 2000-01-03)",
         "vix9d: 300 of 600 rows missing (data from 2001-02-26)",  # IDX[300]
+        "vix1y: 250 of 600 rows missing (data from 2000-12-18)",  # IDX[250]
         "vxth: no data",
     ]
 
@@ -338,3 +344,10 @@ def test_load_market_missing_required_raises(tmp_path, monkeypatch, drop, name):
     _fake_sources(monkeypatch, tmp_path, drop={drop})
     with pytest.raises(RuntimeError, match=f"'{name}'"):
         data.load_market("1999-01-01")
+
+
+def test_fixture_has_the_panel_columns():
+    # the committed 2018-2019 fixture is a load_market slice: the 13 columns, VIX1Y included and complete
+    fx = pd.read_csv(Path(__file__).parent / "fixtures" / "market_2018_2019.csv", index_col="date", parse_dates=True)
+    assert list(fx.columns) == data.COLUMNS
+    assert fx["vix1y"].notna().all() and len(fx) == 503

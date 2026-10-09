@@ -160,8 +160,9 @@ def test_calibrate_skew_marks_one_best(monkeypatch):
     g = replicate.calibrate_skew(MKT, m_grid=[0.3, 0.5, 0.7], train_end="2019-12-31")
     assert g.index.tolist() == [0.3, 0.5, 0.7] and g["best"].sum() == 1
     assert {"te", "dcagr", "corr", "cap_share"} <= set(g.columns)
-    # the slope cap binds above SKEW 100 + 60 c_max / m: 155.70 at m 0.7, passed on 2018-08-13 only (159.03)
-    assert g["cap_share"].tolist() == pytest.approx([0, 0, 1 / len(MKT)])
+    # the slope cap binds above SKEW 100 + 60 c* / m, c* the 30 d cap at the day's VIX (0.39 .. 0.64 on the
+    # fixture, median 0.46: SKEW 155 at m 0.5, 140 at m 0.7): never at m 0.3, 5 days at m 0.5, 99 at m 0.7
+    assert g["cap_share"].tolist() == pytest.approx([0, 5 / len(MKT), 99 / len(MKT)])
     ok = g[g["dcagr"].abs() <= replicate.TOLERANCE["PPUT"]["dcagr"]]
     assert g["te"].idxmin() not in ok.index  # the fixture separates the two rules
     assert g.loc[g["best"], "te"].iloc[0] == ok["te"].min()

@@ -12,10 +12,10 @@ its cash, coverage counting every long leg held and 0 while none is, the offset 
 pass-through (expiries move with offset rolls), rolls before the first usable pricing row skipped,
 a NaN input day on a quiet day and on a crash expiry (model inputs carried, spot not) and a
 partial-pillar day (not a fallback), the expiry-week return-rounding limit, cash accrual and the
-rates, dividends, VIX pillars and smile knobs reaching the pricer, the term-structure back-fill, a
-delta-targeted strike, z_cap reaching the quotes and the delta strike, spec validation, the T-bill
-sleeve, the par-bond proxy, long/flat time-series momentum and the build time of a Universa-like
-sleeve on a 9,000-day panel.
+rates, dividends, VIX pillars (VIX1Y on a 13-month put) and smile knobs reaching the pricer, the
+term-structure back-fill, a delta-targeted strike, z_cap reaching the quotes and the delta strike,
+spec validation, the T-bill sleeve, the par-bond proxy, long/flat time-series momentum and the
+build time of a Universa-like sleeve on a 9,000-day panel.
 
 Why: every option-based safe haven in the backtests is one of these return series, so the
 accounting (what is paid, when, at which quote) is pinned to values recomputed here from
@@ -40,16 +40,16 @@ def _panel(periods: int = 260, start: str = "2019-01-01", **cols) -> pd.DataFram
     rf = q = 0, spxtr = spx; keyword columns override."""
     df = pd.DataFrame({"spx": S0, "vix": 20.0, "skew": 130.0, "rf": 0.0, "q": 0.0} | cols,
                       index=pd.bdate_range(start, periods=periods))
-    for c in ("vix9d", "vix3m", "vix6m"):
+    for c in ("vix9d", "vix3m", "vix6m", "vix1y"):
         df[c] = df["vix"]
     df["spxtr"] = df["spx"]
     return df
 
 
-def _quote(leg: dict, t: pd.Timestamp, S: float = S0, vols: tuple = (20.0,) * 4, rf: float = 0.0, q: float = 0.0,
+def _quote(leg: dict, t: pd.Timestamp, S: float = S0, vols: tuple = (20.0,) * 5, rf: float = 0.0, q: float = 0.0,
            **kw) -> tuple:
     """(mid, bid, ask) of an attrs["legs"] entry on date t: SKEW 130, VIX pillars `vols` (vix9d, vix,
-    vix3m, vix6m), r = ln(1 + rf), q; kw (m, nu, h, z_cap) passed to pricing.quote."""
+    vix3m, vix6m[, vix1y]), r = ln(1 + rf), q; kw (m, nu, h, z_cap) passed to pricing.quote."""
     T = (leg["expiry"] - t).days / 365
     return pricing.quote(S, leg["K"], T, pricing.var_swap_vol(T, *vols), 130.0, np.log1p(rf), q, leg["cp"], **kw)
 
@@ -330,7 +330,7 @@ def test_offset_and_roll_frequency_reach_the_calendar():
 
 def test_rolls_before_the_first_usable_inputs_are_skipped():
     mkt = _panel()
-    mkt.loc[mkt.index < "2019-02-20", ["vix9d", "vix", "vix3m", "vix6m", "skew"]] = np.nan
+    mkt.loc[mkt.index < "2019-02-20", [*sleeves._VOLS, "skew"]] = np.nan
     df = sleeves.option_sleeve(mkt, OptionSpec((PUT25,)))
     # the 01-18 and 02-15 rolls have no model inputs at or before them (none borrowed from later rows)
     assert df.index[df["event"]][0] == pd.Timestamp("2019-03-15") == df.attrs["legs"][0]["open_date"]
@@ -358,22 +358,25 @@ def test_nan_input_day_carries_the_model_inputs_not_the_spot():
 
 
 def test_expiry_week_payoff_is_lost_to_return_rounding():
-    # pins the ret-rounding limit (ponytail in option_sleeve): a far-OTM put held to expiry at f = 1 and VIX 12
-    # marks below 1e-16 of the day before in expiry week, so ret rounds to -1 and the crash payoff that
-    # follows never reaches the compounded NAV
+    # pins the ret-rounding limit (ponytail in option_sleeve): under a flat put wing (finite z_cap) a far-OTM
+    # put held to expiry at f = 1 and VIX 12 marks below 1e-16 of the day before in expiry week, so ret rounds
+    # to -1 and the crash payoff that follows never reaches the compounded NAV
     mkt = _panel(periods=40, vix=12.0)
     mkt.loc[mkt.index >= "2019-02-14", ["spx", "spxtr"]] = 0.7 * S0
-    df = sleeves.option_sleeve(mkt, OptionSpec((PUT25,)), m=0.5)
+    df = sleeves.option_sleeve(mkt, OptionSpec((PUT25,)), m=0.5, z_cap=3.0)
     g = df.attrs["legs"][0]
     assert df.at[pd.Timestamp("2019-02-13"), "ret"] == -1.0  # the mark fell below 1e-16 of the day before
     assert g["closed_on"] == pd.Timestamp("2019-02-15") and g["n"] * (0.75 - 0.7) * S0 > 1000  # settled > 1000x
     assert _nav(df)["2019-02-15"] == 0.0
+    # the default linear wing keeps the mark alive into expiry (-30% on 02-13), so the payoff lands: ~600x
+    nav = _nav(sleeves.option_sleeve(mkt, OptionSpec((PUT25,)), m=0.5))
+    assert nav["2019-02-13"] > 0 and nav["2019-02-15"] > 100
 
 
 def test_rates_dividends_and_pillars_reach_cash_and_the_pricer():
-    vols = (16.0, 20.0, 22.0, 24.0)  # vix9d, vix, vix3m, vix6m
+    vols = (16.0, 20.0, 22.0, 24.0, 26.0)  # vix9d, vix, vix3m, vix6m, vix1y
     mkt = _panel(rf=0.05, q=0.02)
-    mkt["vix9d"], mkt["vix3m"], mkt["vix6m"] = vols[0], vols[2], vols[3]
+    mkt["vix9d"], mkt["vix3m"], mkt["vix6m"], mkt["vix1y"] = vols[0], vols[2], vols[3], vols[4]
     mkt["spxtr"] = S0 * 1.0001 ** np.arange(len(mkt))
     kw = {"m": 0.3, "nu": 1.1, "h": 0.0}
     df = sleeves.option_sleeve(mkt, OptionSpec((PUT25,), premium_frac=0.5), **kw)
@@ -389,6 +392,12 @@ def test_rates_dividends_and_pillars_reach_cash_and_the_pricer():
     # overlay with the default underlying holds spxtr before the first roll
     ov = sleeves.option_sleeve(mkt, OptionSpec((Leg("P", otm=0.05),), mode="overlay"))
     np.testing.assert_allclose(_nav(ov)[:a], mkt["spxtr"][:a] / S0, rtol=1e-12)
+    # a 13-month (TAIL-style) put is priced off the 365 d VIX1Y pillar, not flat VIX6M past 184 d
+    y = sleeves.option_sleeve(mkt, OptionSpec((Leg("P", otm=0.25, tenor_months=13, hold_months=1),)), **kw)
+    g = y.attrs["legs"][0]
+    assert (g["expiry"] - a).days > 365
+    assert g["unit_cost"] == pytest.approx(_quote(g, a, **rates)[2], rel=1e-12)
+    assert g["unit_cost"] > 1.05 * _quote(g, a, **(rates | {"vols": vols[:4]}))[2]
 
 
 def test_term_structure_is_back_filled_before_pricing():
@@ -477,7 +486,8 @@ def test_universa_sleeve_builds_fast():
     vix = 18 * np.exp(0.3 * np.sin(np.arange(n) / 150) + rng.normal(0, 0.08, n))
     mkt = pd.DataFrame(
         {"spx": spx, "spxtr": spx * np.exp(0.02 * np.arange(n) / 252), "vix": vix, "vix9d": 0.9 * vix,
-         "vix3m": 1.05 * vix, "vix6m": 1.1 * vix, "skew": 115 + 20 * rng.random(n), "rf": 0.03, "q": 0.02},
+         "vix3m": 1.05 * vix, "vix6m": 1.1 * vix, "vix1y": 1.15 * vix, "skew": 115 + 20 * rng.random(n),
+         "rf": 0.03, "q": 0.02},
         index=pd.bdate_range("1990-01-02", periods=n),
     )
     spec = OptionSpec((Leg("P", otm=0.25, tenor_months=2, hold_months=1),), monetize_mult=5.0)

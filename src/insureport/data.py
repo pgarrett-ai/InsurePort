@@ -23,7 +23,7 @@ CBOE_URL = "https://cdn.cboe.com/api/global/us_indices/daily_prices/{sym}_Histor
 FRED_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}"
 MAX_AGE_S = 20 * 3600
 YF_START = "1927-01-01"  # always fetch full history so the cache never depends on `start`
-COLUMNS = ["spx", "spxtr", "vix", "vix9d", "vix3m", "vix6m", "skew", "rf", "q", "pput", "cll", "vxth"]
+COLUMNS = ["spx", "spxtr", "vix", "vix9d", "vix3m", "vix6m", "vix1y", "skew", "rf", "q", "pput", "cll", "vxth"]
 REQUIRED = {"spx", "spxtr", "vix", "skew", "rf"}
 _EMPTY = pd.Series(dtype=float, index=pd.DatetimeIndex([]))
 
@@ -138,7 +138,7 @@ def prices(tickers: list[str], start: str = YF_START) -> pd.DataFrame:
 
 
 def cboe(symbol: str) -> pd.Series:
-    """Daily close of a Cboe index (VIX, VIX9D, VIX6M, SKEW, PPUT, CLL, VXTH) from the Cboe CDN, cached."""
+    """Daily close of a Cboe index (VIX, VIX9D, VIX6M, VIX1Y, SKEW, PPUT, CLL, VXTH) from the Cboe CDN, cached."""
     return _cached("cboe", symbol, lambda: parse_cboe_csv(_http_text(CBOE_URL.format(sym=symbol)), symbol))
 
 
@@ -150,8 +150,9 @@ def fred(series_id: str) -> pd.Series:
 def load_market(start: str = "1990-01-01") -> pd.DataFrame:
     """Daily market panel on ^GSPC trading days from `start`.
 
-    Columns: spx / spxtr (S&P 500 price / total-return index), vix, vix9d, vix3m, vix6m, skew,
-    rf (DTB3 / 100, decimal), q (dividend yield), pput, cll, vxth. Every non-SPX series is
+    Columns: spx / spxtr (S&P 500 price / total-return index), vix, vix9d, vix3m, vix6m, vix1y
+    (Cboe VIX1Y, from 2007-01-03), skew, rf (DTB3 / 100, decimal), q (dividend yield), pput, cll,
+    vxth. Every non-SPX series is
     forward-filled at most 5 rows. q = ln(TR_t/TR_{t-252}) - ln(PX_t/PX_{t-252}) clipped to
     [0, 0.06], computed on full history so the lookback reaches before `start`; gaps in TR carry
     the last q forward. ASSUMPTION: q = 0.03 until TR has 252 rows of history (TR starts 1988,
@@ -168,6 +169,7 @@ def load_market(start: str = "1990-01-01") -> pd.DataFrame:
         "vix9d": cboe("VIX9D"),
         "vix3m": px.get("^VIX3M", _EMPTY),
         "vix6m": cboe("VIX6M"),
+        "vix1y": cboe("VIX1Y"),
         "skew": cboe("SKEW"),
         "rf": fred("DTB3") / 100,
         "pput": cboe("PPUT"),

@@ -4,8 +4,9 @@ out of sample against Cboe PPUT, PPUT3M and CLL (network required).
 Usage, from the repo root: .venv/Scripts/python scripts/calibrate.py
 Prints the m grid and the chosen m (with the share of training days where the slope cap binds),
 the validation table with PASS / FAIL per target and the roll-day vs non-roll-day TE split for
-z_cap in {2.5, 3, 4}, two informational rows (PPUT3M 2004-2015 inside the training period, CLL
-from 2009-10-19, after Cboe's 2009-10-16 splice), the SKEW_MULT line to paste into pricing.py and a
+z_cap in {inf, 2.5, 3, 4} (inf, the default linear wing pricing.Z_CAP, is the gate; the finite caps
+are the flat-wing sensitivity rows), two informational rows (PPUT3M 2004-2015 inside the training
+period, CLL from 2009-10-19, after Cboe's 2009-10-16 splice), the SKEW_MULT line to paste into pricing.py and a
 markdown table for METHODOLOGY.md. A row whose window starts before its target's launch
 (replicate.LAUNCH) is labelled as holding Cboe back-test levels. Writes
 figures/calibration_pput, replication_pput and replication_cll as PNG (kaleido installed) or
@@ -23,7 +24,7 @@ from insureport import replicate as rp
 from insureport.data import cboe, load_market
 
 FIGURES = Path(__file__).resolve().parents[1] / "figures"
-Z_CAPS = (2.5, 3.0, 4.0)  # must hold pricing.Z_CAP, the gate
+Z_CAPS = (pricing.Z_CAP, 2.5, 3.0, 4.0)  # the default (inf, the gate) first, then the flat-wing sensitivity
 PNG = importlib.util.find_spec("kaleido") is not None
 COLS = ["window_start", "window_end", "n_months", "te", "dcagr", "corr", "dmaxdd", "te_roll", "te_nonroll", "verdict"]
 
