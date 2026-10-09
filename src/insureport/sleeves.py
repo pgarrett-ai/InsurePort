@@ -8,12 +8,14 @@ synthetic SPX option packages priced by pricing.py in one of two sizing modes:
   the engine's event-day rebalance refills it (the "monthly premium" behaviour);
 - overlay: the sleeve is the underlying plus options on coverage x its value, the premium
   financed by selling stock (protective put, collar, Cboe PPUT / CLL replication).
+Given a real end-of-day chain (chains.py), option_sleeve opens listed SPX contracts and prices
+them from its quotes, the model filling the leg-days without one.
 Also T-bills (tbill_sleeve, AQR's "hold less equity"), a constant-maturity par-bond proxy
 (bond_proxy) and SPX time-series momentum (tsmom_sleeve).
 
-Pure numpy/pandas + pricing.py, no I/O. Panel columns as in data.load_market: spx, spxtr and
-the vol indices in index points (plus spx_open, needed only by specs that strike or settle at the
-open), rf and q decimals. Cash accrues rf_{t-1} * calendar days / 360
+Pure numpy/pandas + pricing.py and the chains.py lookups, no I/O. Panel columns as in
+data.load_market: spx, spxtr and the vol indices in index points (plus spx_open, needed only by
+specs that strike or settle at the open), rf and q decimals. Cash accrues rf_{t-1} * calendar days / 360
 (portfolio.cash_returns); options are priced with r = ln(1 + rf).
 """
 
@@ -23,7 +25,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from insureport import pricing
+from insureport import chains, pricing
 from insureport.portfolio import cash_returns
 
 WIPED_OUT = 1e-12  # a sleeve left with this fraction of its NAV at the previous event restarts from unit capital
@@ -172,23 +174,27 @@ def _inputs(mkt: pd.DataFrame, settle: str = "close") -> dict[str, np.ndarray]:
 
 def _settle_row(day: np.ndarray, expiry: np.ndarray) -> np.ndarray:
     """Row on which a leg expiring on `expiry` settles (at its close or open, per OptionSpec.settle): the
-    last trading day on or before it (a Good Friday expiry settles on Thursday); len(day) when expiry is
-    past the data."""
-    return np.where(expiry <= day[-1], np.searchsorted(day, expiry, side="right") - 1, len(day))
+    last trading day on or before it (a Good Friday expiry settles on Thursday); len(day) when expiry,
+    rolled back off a weekend (a pre-2015 Saturday expiration settles on the Friday), is past the data."""
+    e = np.busday_offset(np.asarray(expiry, "datetime64[D]"), 0, roll="backward")
+    return np.where(e <= day[-1], np.searchsorted(day, e, side="right") - 1, len(day))
 
 
 def _quotes(
     px: dict[str, np.ndarray], day: np.ndarray, K: np.ndarray, expiry: np.ndarray, call: np.ndarray,
-    *, m: float, nu: float, h: float, z_cap: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """(mid, bid, ask) in index points, elementwise: option (K, expiry, call) on panel row `day`.
+    *, m: float, nu: float, h: float, z_cap: float, chain: pd.DataFrame | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """(mid, bid, ask, fallback) in index points, elementwise: option (K, expiry, call) on panel row `day`.
 
     The model branch: pricing.quote (m, nu, h, z_cap passed on) at the row's S, T = (expiry -
     date)/365 and the vols, skew, r, q of the last usable row (_inputs `eff`: the row itself
     unless its inputs are unusable), vs = var_swap_vol(T, VIX pillars). From the settle row
     (_settle_row) on, T = 0: the mid is the intrinsic value at the settle row's px["settle"] (its
     close, or its open for AM settlement), frozen.
-    Slice 9 adds the real-chain lookup here.
+    chain (canonical, chains.py): rows before the settle row take the "SPX" quote listed for
+    (date, expiry, K, cp) where there is one (chains.quotes, the vectorised quote_at); fallback (bool)
+    marks the rows before the settle row priced by the model because none is listed. Without a chain,
+    fallback marks the rows priced off carried inputs (_inputs `stale`).
     """
     # ponytail: the open stands in for the SOQ (the opening prints of all 500 stocks); EOD data has no SOQ
     settle = _settle_row(px["day"], expiry)
@@ -206,12 +212,18 @@ def _quotes(
                 S[sel], K[sel], T[sel], vs[sel], px["skew"][r], px["r"][r], px["q"][r], cp,
                 m=m, nu=nu, h=h, z_cap=z_cap,
             )
-    return out[0], out[1], out[2]
+    if chain is None:
+        return out[0], out[1], out[2], px["stale"][day]
+    live = day < settle
+    q = chains.quotes(chain, px["day"][day], expiry, K, np.where(call, "C", "P"))
+    got = live & ~np.isnan(q[0])
+    out[:, got] = q[:, got]
+    return out[0], out[1], out[2], live & ~got
 
 
 def _open_legs(
     px: dict[str, np.ndarray], opens: list[tuple[int, Leg, int]], offset: int, *, m: float, nu: float, h: float,
-    z_cap: float,
+    z_cap: float, chain: pd.DataFrame | None = None,
 ) -> list[dict]:
     """New legs from (open row, Leg, scheduled close row; len(panel) = past the data).
 
@@ -219,9 +231,16 @@ def _open_legs(
     (delta, at S_ref and the last usable vols, skew, r, q), snapped by Leg.strike_rule. Expiry = third
     Friday of (M + tenor_months), M the month of the row `offset` rows before the open (the un-shifted
     roll); with offset != 0 it then moves like the rolls: snapped to the last row on or before it and
-    shifted `offset` rows (past the data, `offset` business days). Each leg carries its quotes `mid`,
-    `bid`, `ask` (arrays, one entry per row from its open to its close or the last row, all legs in ONE
-    _quotes call) and unit_cost = ask (long) / bid (short) on the open row.
+    shifted `offset` rows (past the data, `offset` business days). With a chain, K and expiry then
+    snap to chains.select_contract(chain, open date, target, K, cp) (source "chain"), target = the
+    un-shifted third Friday's trading day (the last row on or before it: a holiday Friday's AM monthly
+    is listed on the Thursday; past the data, the day before the Friday), so an offset leg is still the
+    listed monthly. The leg keeps the model's K and expiry (source "model") when nothing is listed, or,
+    DEVIATION from the brief (its select_contract result taken as is), when the listing found is one
+    before the target that settles before the leg's scheduled close (a chain short of far expirations;
+    it would sit dead at intrinsic until its roll). Each leg carries its quotes `mid`, `bid`,
+    `ask` and `fb` (_quotes' fallback flags) (arrays, one entry per row from its open to its close or
+    the last row, all legs in ONE _quotes call) and unit_cost = ask (long) / bid (short) on the open row.
     """
     if not opens:
         return []
@@ -231,6 +250,11 @@ def _open_legs(
     for t, L, close in opens:
         d = pd.Timestamp(day[min(max(t - offset, 0), n - 1)])
         expiry = third_friday(d.year, d.month + L.tenor_months).to_datetime64().astype("datetime64[D]")
+        # the chain's listed monthly: on the Friday's trading day; past the data from the Thursday, the listing
+        # of a holiday Friday (Good Friday, Juneteenth) the panel cannot show.
+        # ponytail: past the data a rootless chain (ORATS / IvyDB, all "SPX") then opens a 2022+ Thursday weekly
+        # instead of the Friday monthly, one day short; prefer a Friday listing there if that ever matters
+        target = day[_settle_row(day, expiry)] if expiry <= day[-1] else expiry - np.timedelta64(1, "D")
         if offset:
             j = int(np.searchsorted(day, expiry, side="right")) - 1 + offset
             expiry = (day[j] if expiry <= day[-1] and 0 <= j < n
@@ -245,19 +269,26 @@ def _open_legs(
             vs = float(pricing.var_swap_vol(T, *(px[c][row] for c in _VOLS)))
             args = (S, T, vs, px["skew"][row], px["r"][row], px["q"][row])
             K = pricing.strike_for_delta(*args, L.delta, L.cp, m=m, nu=nu, z_cap=z_cap)
-        K = _snap(K, L.strike_rule, L.grid)
+        K, source = _snap(K, L.strike_rule, L.grid), "model"
+        # ponytail: one root, SPX monthlies (AM-settled); SPXW weeklies / PM dailies in a chain are ignored. Give
+        # Leg a root if a strategy needs weeklies (then settle those at the close)
+        hit = None if chain is None else chains.select_contract(chain, day[t], target, K, L.cp)
+        e = None if hit is None else hit[0].to_datetime64().astype("datetime64[D]")
+        if e is not None and _settle_row(day, e) >= min(close, _settle_row(day, target)):
+            expiry, K, source = e, hit[1], "chain"
         settle = int(_settle_row(px["day"], expiry))
         legs.append({"leg": L, "open": t, "close": close, "K": float(K), "expiry": expiry, "settle": settle,
-                     "n": 0.0, "closed_on": None, "reason": None})
+                     "n": 0.0, "closed_on": None, "reason": None, "source": source})
     lens = [min(g["close"], n - 1) - g["open"] + 1 for g in legs]
     day = np.concatenate([np.arange(g["open"], g["open"] + k) for g, k in zip(legs, lens)])
     K = np.repeat([g["K"] for g in legs], lens)
     expiry = np.repeat(np.array([g["expiry"] for g in legs]), lens)
     call = np.repeat([g["leg"].cp == "C" for g in legs], lens)
     cuts = np.cumsum(lens)[:-1]
-    quotes = (np.split(a, cuts) for a in _quotes(px, day, K, expiry, call, m=m, nu=nu, h=h, z_cap=z_cap))
-    for g, mid, bid, ask in zip(legs, *quotes):
-        g["mid"], g["bid"], g["ask"] = mid, bid, ask
+    quotes = (np.split(a, cuts) for a in _quotes(px, day, K, expiry, call, m=m, nu=nu, h=h, z_cap=z_cap,
+                                                 chain=chain))
+    for g, mid, bid, ask, fb in zip(legs, *quotes):
+        g["mid"], g["bid"], g["ask"], g["fb"] = mid, bid, ask, fb
         g["unit_cost"] = float(ask[0] if g["leg"].qty > 0 else bid[0])
     return legs
 
@@ -282,6 +313,7 @@ def option_sleeve(
     h: float = 0.05,
     offset_bdays: int = 0,
     z_cap: float = pricing.Z_CAP,
+    chain: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Daily returns of a rolled synthetic-SPX-option sleeve, per unit of sleeve capital.
 
@@ -293,7 +325,10 @@ def option_sleeve(
     month has one; a month missing from the data pushes the close one roll later.
     DEVIATION from the brief (third-Friday expiries): with offset_bdays the open month is read on
     the un-shifted calendar and the expiry moves offset_bdays rows like the rolls (_open_legs), so
-    the offset sweep changes roll timing only, not tenor or coverage.
+    the offset sweep changes roll timing only, not tenor or coverage. Under a chain the leg is the
+    listed monthly of that un-shifted calendar instead, so the tenor stays but coverage does not:
+    offset_bdays > 0 leaves it settled at intrinsic for offset_bdays rows before its roll, < 0 closes
+    it at the bid / ask |offset_bdays| rows before it expires.
     Before the first roll the sleeve is all cash (premium) or all underlying (overlay).
 
     State: cash C (grows by 1 + rf_{t-1} days/360), stock A (overlay; grows with `underlying`,
@@ -330,9 +365,24 @@ def option_sleeve(
 
     Between events holdings are fixed and marked in one vectorized step. A row with unusable
     inputs (_inputs) prices every leg at the row's own S and date with the last usable vols, SKEW,
-    r and q; each leg-day held on it before settlement counts in fallback_quotes. DEVIATION from
-    the brief (carry the previous day's mark): a carried mark would also carry yesterday's spot
-    into settlements, new strikes, closes and overlay sizing.
+    r and q; each leg-day held or closed on it before settlement counts in fallback_quotes.
+    DEVIATION from the brief (carry the previous day's mark): a carried mark would also carry
+    yesterday's spot into settlements, new strikes, closes and overlay sizing. DEVIATION from the
+    slice-4 brief (held leg-days; changed in slice 9, with or without a chain): a close priced off
+    carried inputs also counts, as a close without a chain quote does below.
+
+    chain (a canonical chains.py chain, e.g. chains.load_chain): real quotes. At every open
+    (scheduled or monetize) the leg's strike (strike_rule applied) and the third Friday of its
+    un-shifted calendar snap to chains.select_contract among the "SPX" rows (_open_legs); nothing
+    listed, or (DEVIATION from the brief, which takes select_contract's pick as is) only a listing that
+    would expire before the leg's scheduled close: the model's strike and expiry. Opens (ask long /
+    bid short), marks (mid) and closes (bid long / ask short) before the settle row take that
+    contract's chain quote on the day; a leg-day without one is priced by the
+    model (same strike and expiry) and, when held at the close or closed that day, counts in
+    fallback_quotes, which then counts these missing quotes only (a stale model input under a chain
+    quote is not a fallback). Settlement stays intrinsic (spec.settle) from the last trading day on or
+    before the listed expiration (a pre-2015 Saturday expiration settles on the Friday, a holiday
+    Friday's Thursday listing on the Thursday).
 
     Returns a DataFrame on mkt.index: ret, event (bool, rolls and monetizations), premium_paid
     (B / NAV_pre on events, else 0), coverage (long option notional held / NAV_post as of the
@@ -340,8 +390,9 @@ def option_sleeve(
     opened (size n != 0), by open date: open_date, close_date (scheduled; None past the data),
     expiry, cp, K, n, unit_cost, closed_on (None if still open), close_reason ("roll" | "expiry" |
     "monetize" | None), settle_px (the level it settled at; None unless it reached its expiry in
-    the data). pandas deep-copies attrs into every derived object (~50 ms per op on a
-    9,000-day sleeve), so strip it before heavy arithmetic: r = df["ret"].copy(); r.attrs = {}.
+    the data), source ("chain": a listed contract, "model": none found or no chain). pandas
+    deep-copies attrs into every derived object (~50 ms per op on a 9,000-day sleeve), so strip it
+    before heavy arithmetic: r = df["ret"].copy(); r.attrs = {}.
     Raises ValueError on an invalid spec or a premium package that costs <= 0.
     """
     _check(spec)
@@ -350,7 +401,7 @@ def option_sleeve(
         raise ValueError("the spec settles or strikes at the open: mkt needs spx_open values")
     if "ts_filled" not in mkt:
         mkt = pricing.fill_term_structure(mkt)
-    px, n, kw = _inputs(mkt, spec.settle), len(mkt), {"m": m, "nu": nu, "h": h, "z_cap": z_cap}
+    px, n, kw = _inputs(mkt, spec.settle), len(mkt), {"m": m, "nu": nu, "h": h, "z_cap": z_cap, "chain": chain}
     premium = spec.mode == "premium"
     ev = mkt.index.get_indexer(roll_dates(mkt.index, spec.roll_every_months, offset_bdays))
     ev = ev[px["eff"][ev] >= 0].tolist()
@@ -404,8 +455,9 @@ def option_sleeve(
                 mark = np.array([[g["n"] * g["mid"][t - g["open"]] for g in rest]])
                 monetize = bool(_cashed_in(rest, mark, spec.monetize_mult)[0])
             # ponytail: monetize-day rebalance flows are charged the normal bid haircut only on the option legs
-            # ponytail: a leg past settlement sits at frozen intrinsic (no rf) until its roll; only happens when
-            # a month is missing from the data. Sweep it to cash on the settle row if gappy panels matter.
+            # ponytail: a leg past settlement sits at frozen intrinsic (no rf) until its roll: when a month is
+            # missing from the data, or under a chain with offset_bdays > 0 (the listed monthly expires before the
+            # shifted roll). Sweep it to cash on the settle row if gappy panels or offset chain sweeps matter.
             for g in held:
                 if g["close"] <= t or monetize:
                     i, expired = t - g["open"], t >= g["settle"]
@@ -450,9 +502,9 @@ def option_sleeve(
                 break
 
     legs = [g for g in legs if g["n"]]  # drop N = 0 packages (premium cash all in legs held over the roll)
-    for g in legs:  # leg-days priced off carried inputs: held at the close, before settlement
-        e = min(n if g["closed_on"] is None else g["closed_on"], g["settle"])
-        fb[g["open"] : e] += px["stale"][g["open"] : e]
+    for g in legs:  # leg-days priced by a fallback (carried inputs / no chain quote): held or closed, pre-settlement
+        e = min(n if g["closed_on"] is None else g["closed_on"] + 1, g["settle"])
+        fb[g["open"] : e] += g["fb"][: e - g["open"]]
     out = pd.DataFrame(
         {"ret": ret, "event": event, "premium_paid": paid, "coverage": pd.Series(cover).ffill().fillna(0.0).to_numpy(),
          "fallback_quotes": fb},
@@ -472,6 +524,7 @@ def option_sleeve(
             "close_reason": g["reason"],
             "settle_px": (float(px["settle"][g["settle"]]) if g["settle"] < n
                           and (g["closed_on"] is None or g["closed_on"] >= g["settle"]) else None),
+            "source": g["source"],
         }
         for g in sorted(legs, key=lambda g: g["open"])
     ]
