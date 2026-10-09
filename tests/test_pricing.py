@@ -251,7 +251,7 @@ def test_lee_root_kept_by_the_slope_cap():
 def test_deep_linear_wing_breaks_convexity():
     # the smile_vol LIMIT, pinned so it stays visible: at vs 0.15, SKEW 183, m 0.3 (c = 0.415), 30 d, the
     # wing is concave in K from z ~ 25 (K/S < 0.39) and the 0.25 / 0.30 / 0.35 S put butterfly costs -0.0067
-    p25, p30, p35 = pricing.quote(1000.0, np.array([250.0, 300, 350]), 30 / 365, 0.15, 183, 0.03, 0.015, h=0)[0]
+    p25, p30, p35 = pricing.quote(1000.0, np.array([250.0, 300, 350]), 30 / 365, 0.15, 183, 0.03, 0.015, h=0, m=0.3)[0]
     assert p25 - 2 * p30 + p35 == pytest.approx(-0.0067, abs=1e-4)
 
 
@@ -503,12 +503,12 @@ def test_strike_for_delta():
     with pytest.raises(ValueError):
         pricing.strike_for_delta(S, T, np.nan, 130, R, Q, 0.05)
     # the linear wing keeps far strikes' delta alive: at 61 d, vs 0.15, SKEW 183 the 0.005 (dao_ch9) and
-    # 0.001 put strikes lie past ln(K/F) = -1.5 (|delta| 0.0053 there), inside the [-8, 1] bracket
+    # 0.001 put strikes lie past ln(K/F) = -1.5 (|delta| 0.0053 there), inside the [-8, 1] bracket (m 0.3)
     t = 61 / 365
     for d in (0.005, 0.001):
-        Kd = pricing.strike_for_delta(S, t, 0.15, 183, R, Q, d)
+        Kd = pricing.strike_for_delta(S, t, 0.15, 183, R, Q, d, m=0.3)
         assert Kd < S * np.exp((R - Q) * t - 1.5)
-        vol_d = pricing.smile_vol(S, Kd, t, 0.15, 183, R, Q)
+        vol_d = pricing.smile_vol(S, Kd, t, 0.15, 183, R, Q, m=0.3)
         assert pricing.bs_delta(S, Kd, t, vol_d, R, Q, "P") == pytest.approx(-d, rel=1e-6)
 
 

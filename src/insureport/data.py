@@ -23,7 +23,7 @@ CBOE_URL = "https://cdn.cboe.com/api/global/us_indices/daily_prices/{sym}_Histor
 FRED_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}"
 MAX_AGE_S = 20 * 3600
 YF_START = "1927-01-01"  # always fetch full history so the cache never depends on `start`
-COLUMNS = ["spx", "spxtr", "vix", "vix9d", "vix3m", "vix6m", "vix1y", "skew", "rf", "q", "pput", "cll", "vxth"]
+COLUMNS = ["spx", "spx_open", "spxtr", "vix", "vix9d", "vix3m", "vix6m", "vix1y", "skew", "rf", "q", "pput", "cll", "vxth"]
 REQUIRED = {"spx", "spxtr", "vix", "skew", "rf"}
 _EMPTY = pd.Series(dtype=float, index=pd.DatetimeIndex([]))
 
@@ -33,17 +33,17 @@ def data_dir() -> Path:
     return Path(os.environ.get("INSUREPORT_DATA_DIR", "data"))
 
 
-def _yf_download(tickers: list[str], start: str) -> pd.DataFrame:
-    """SEAM. Adjusted daily Close from yfinance; columns = tickers, tz-naive DatetimeIndex."""
+def _yf_download(tickers: list[str], start: str, field: str = "Close") -> pd.DataFrame:
+    """SEAM. Adjusted daily `field` ("Close", or "Open") from yfinance; columns = tickers, tz-naive DatetimeIndex."""
     if os.environ.get("INSUREPORT_OFFLINE") == "1":
         raise RuntimeError(f"INSUREPORT_OFFLINE=1: refusing yfinance download of {tickers}")
     import yfinance as yf  # lazy: heavy import, only needed live
 
-    close = yf.download(tickers, start=start, auto_adjust=True, progress=False)["Close"]
-    close.index = pd.DatetimeIndex(close.index).tz_localize(None)
+    px = yf.download(tickers, start=start, auto_adjust=True, progress=False)[field]
+    px.index = pd.DatetimeIndex(px.index).tz_localize(None)
     # ponytail: drops today's (possibly in-progress) bar even after the close; it arrives at the next refresh
-    close = close[close.index < pd.Timestamp.now("America/New_York").normalize().tz_localize(None)]
-    return close.reindex(columns=tickers)
+    px = px[px.index < pd.Timestamp.now("America/New_York").normalize().tz_localize(None)]
+    return px.reindex(columns=tickers)
 
 
 def _http_text(url: str) -> str:
@@ -150,10 +150,11 @@ def fred(series_id: str) -> pd.Series:
 def load_market(start: str = "1990-01-01") -> pd.DataFrame:
     """Daily market panel on ^GSPC trading days from `start`.
 
-    Columns: spx / spxtr (S&P 500 price / total-return index), vix, vix9d, vix3m, vix6m, vix1y
-    (Cboe VIX1Y, from 2007-01-03), skew, rf (DTB3 / 100, decimal), q (dividend yield), pput, cll,
-    vxth. Every non-SPX series is
-    forward-filled at most 5 rows. q = ln(TR_t/TR_{t-252}) - ln(PX_t/PX_{t-252}) clipped to
+    Columns: spx / spx_open / spxtr (S&P 500 close / open / total-return index), vix, vix9d, vix3m,
+    vix6m, vix1y (Cboe VIX1Y, from 2007-01-03), skew, rf (DTB3 / 100, decimal), q (dividend yield),
+    pput, cll, vxth. spx_open (^GSPC Open, the replicas' proxy for Cboe's AM settlement and strike
+    reference) is not filled: a missing open stays NaN and sleeves use that row's close. Every
+    non-SPX series is forward-filled at most 5 rows. q = ln(TR_t/TR_{t-252}) - ln(PX_t/PX_{t-252}) clipped to
     [0, 0.06], computed on full history so the lookback reaches before `start`; gaps in TR carry
     the last q forward. ASSUMPTION: q = 0.03 until TR has 252 rows of history (TR starts 1988,
     so this only matters before 1989).
@@ -162,6 +163,10 @@ def load_market(start: str = "1990-01-01") -> pd.DataFrame:
     column with missing rows is described in df.attrs["warnings"].
     """
     px = prices(["^GSPC", "^SP500TR", "^VIX3M"])
+    # ponytail: ^GSPC Open is the 9:30 index print, a stale SOQ proxy: it equals the previous close on 60-96% of
+    # days before 2005 (31% 2005-09, 10% 2010-15, none from 2016), and from 2016 its overnight gap is 0.71x SPY's
+    # traded one (2016-01-15: -0.27% vs -2.69%). Upgrade: SPY's open scaled to SPX (1993->), or Cboe SET values
+    spx_open = _cached("yfinance", "^GSPC_open", lambda: _yf_download(["^GSPC"], YF_START, "Open")["^GSPC"])
     raw = {
         "spx": px.get("^GSPC", _EMPTY),
         "spxtr": px.get("^SP500TR", _EMPTY),
@@ -178,6 +183,7 @@ def load_market(start: str = "1990-01-01") -> pd.DataFrame:
     }
     idx = raw["spx"].dropna().index
     df = pd.DataFrame({k: s.reindex(idx).ffill(limit=5) for k, s in raw.items()}, index=idx)
+    df["spx_open"] = spx_open.reindex(idx)  # unfilled: a stale open must not settle or strike a roll
     tr = raw["spxtr"].reindex(idx)  # unfilled: a missing TR print must not pair with a real PX move
     excess = np.log(tr / tr.shift(252)) - np.log(df["spx"] / df["spx"].shift(252))
     # ponytail: q is a one-day 252-row estimate, so one-day ln(TR/PX) glitches show through (Yahoo's

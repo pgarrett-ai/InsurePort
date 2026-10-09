@@ -2,7 +2,10 @@
 quarterly rolls, months without data, data ending before the roll), the option sleeve in premium
 mode (full budget wiped out and refilled each roll, the output columns, the spread cost on the day
 after the open, coverage, half budget halving the NAV over 50 rolls with no spurious wipe-out, a
-crash paying intrinsic at expiry, a Good Friday expiry settling on Thursday, monetization closing
+crash paying intrinsic at expiry, a Good Friday expiry settling on Thursday, settlement at the open
+(Cboe's SOQ proxy) and its settle_px ledger entry, listed-strike snapping (floor strictly below,
+ceil at or above, continuous; grid ties up to float noise) and the open as the strike reference (a
+missing or all-NaN open column refused), monetization closing
 at the bid and re-striking (also under offset rolls), against the net debit of a spread, the long
 legs' cost of a net-credit collar and on a roll day), overlay mode (the put financed by selling
 stock at coverage 1 and 0.5, premium paid, a custom underlying, a wiped-out stock restarting),
@@ -132,6 +135,58 @@ def test_good_friday_expiry_settles_on_thursday():
     assert _nav(df)[thu] == pytest.approx(g["n"] * (3000 - 2800), rel=1e-12)  # intrinsic on Thursday's close, C = 0
 
 
+def test_settle_at_the_open():
+    # hand case: K 100 (ceil of 0.95 x 104 = 98.8), expiry close 90, open 95: settles at 5 at the open, 10 at the close
+    mkt = _panel(periods=60, spx=104.0)
+    mkt["spx_open"] = mkt["spx"]
+    expiry = pd.Timestamp("2019-02-15")
+    mkt.loc[expiry, ["spx", "spx_open"]] = [90.0, 95.0]
+    leg = Leg("P", otm=0.05, strike_rule="ceil")
+    for settle, px in (("open", 95.0), ("close", 90.0)):
+        df = sleeves.option_sleeve(mkt, OptionSpec((leg,), settle=settle))
+        g = df.attrs["legs"][0]
+        assert g["K"] == 100.0 and g["closed_on"] == expiry and g["close_reason"] == "expiry"
+        assert g["settle_px"] == px and _nav(df)[expiry] == pytest.approx(g["n"] * (100 - px), rel=1e-12)  # C = 0
+        assert df.attrs["legs"][-1]["settle_px"] is None  # expires after the data ends
+        # either way the roll's new leg still opens at the close: strike off 90, priced at 90
+        new = df.attrs["legs"][1]
+        assert new["open_date"] == expiry and new["K"] == 90.0  # ceil(85.5)
+        assert new["unit_cost"] == pytest.approx(_quote(new, expiry, 90.0)[2], rel=1e-12)
+
+
+def test_strike_rules_snap_to_the_grid():
+    # floor: the largest grid multiple strictly below the target; ceil: the smallest at or above
+    assert (sleeves._snap(4982.3, "floor", 5.0), sleeves._snap(4982.3, "ceil", 5.0)) == (4980.0, 4985.0)
+    assert sleeves._snap(4982.3, "continuous", 5.0) == 4982.3
+    assert (sleeves._snap(4980.0, "floor", 5.0), sleeves._snap(4980.0, "ceil", 5.0)) == (4975.0, 4980.0)  # on the grid
+    assert sleeves._snap(8392.26, "ceil", 10.0) == 8400.0
+    # 2700 x 1.1 = 2970.0000000000005: on the grid up to float noise
+    assert (sleeves._snap(2700 * 1.1, "floor", 5.0), sleeves._snap(2700 * 1.1, "ceil", 5.0)) == (2965.0, 2970.0)
+    mkt = _panel(periods=30, spx=4982.3 / 0.95)  # K_target = 0.95 S = 4982.3
+    for rule, K in (("floor", 4980.0), ("ceil", 4985.0), ("continuous", 4982.3)):
+        g = sleeves.option_sleeve(mkt, OptionSpec((Leg("P", otm=0.05, strike_rule=rule),))).attrs["legs"][0]
+        assert g["K"] == pytest.approx(K, rel=1e-12)
+    g = sleeves.option_sleeve(mkt, OptionSpec((Leg("C", otm=0.10, qty=-1.0, strike_rule="ceil"),), mode="overlay"))
+    assert g.attrs["legs"][0]["K"] == 5770.0  # 1.10 S = 5768.98
+
+
+def test_strike_reference_at_the_open():
+    mkt = _panel(periods=30)
+    mkt["spx_open"] = 1.01 * S0  # the open 1% above the close
+    leg = Leg("P", otm=0.05, ref="open")
+    g = sleeves.option_sleeve(mkt, OptionSpec((leg,))).attrs["legs"][0]
+    assert g["K"] == pytest.approx(0.95 * 1.01 * S0, rel=1e-12)
+    assert g["unit_cost"] == pytest.approx(_quote(g, g["open_date"])[2], rel=1e-12)  # bought at the close all the same
+    mkt.loc[g["open_date"], "spx_open"] = np.nan  # no open print: the row's close
+    assert sleeves.option_sleeve(mkt, OptionSpec((leg,))).attrs["legs"][0]["K"] == pytest.approx(0.95 * S0, rel=1e-12)
+    # the open is needed, and absent: no column, or no values (a failed ^GSPC Open fetch would otherwise strike and
+    # settle every roll at the close)
+    for spec in (OptionSpec((leg,)), OptionSpec((PUT25,), settle="open")):
+        for bare in (_panel(periods=30), _panel(periods=30, spx_open=np.nan)):
+            with pytest.raises(ValueError, match="spx_open"):
+                sleeves.option_sleeve(bare, spec)
+
+
 def test_monetize_sells_at_the_bid_and_restrikes():
     mkt = _panel(periods=60)
     hit = pd.Timestamp("2019-01-31")
@@ -146,6 +201,8 @@ def test_monetize_sells_at_the_bid_and_restrikes():
     # fresh package: strike off that day's S and expiry from that month, closed at the next scheduled roll
     assert new["K"] == 0.75 * 3200.0 and new["expiry"] == pd.Timestamp("2019-03-15")
     assert new["close_date"] == old["close_date"] == new["closed_on"] == pd.Timestamp("2019-02-15")
+    # both closed before their 03-15 expiry (inside the data): no settlement price
+    assert (old["settle_px"], new["settle_px"], new["close_reason"]) == (None, None, "roll")
     # offset rolls (02-01, 03-01, 03-29): a 02-12 re-strike reads its month 10 rows earlier (01-29, January),
     # so it expires on March's shifted roll, after its close
     mkt.loc[mkt.index >= hit, ["spx", "spxtr"]] = S0
@@ -368,7 +425,7 @@ def test_expiry_week_payoff_is_lost_to_return_rounding():
     assert df.at[pd.Timestamp("2019-02-13"), "ret"] == -1.0  # the mark fell below 1e-16 of the day before
     assert g["closed_on"] == pd.Timestamp("2019-02-15") and g["n"] * (0.75 - 0.7) * S0 > 1000  # settled > 1000x
     assert _nav(df)["2019-02-15"] == 0.0
-    # the default linear wing keeps the mark alive into expiry (-30% on 02-13), so the payoff lands: ~600x
+    # the linear wing (z_cap inf) keeps the mark alive into expiry (-30% on 02-13), so the payoff lands: ~600x
     nav = _nav(sleeves.option_sleeve(mkt, OptionSpec((PUT25,)), m=0.5))
     assert nav["2019-02-13"] > 0 and nav["2019-02-15"] > 100
 
@@ -442,6 +499,10 @@ def test_z_cap_reaches_quotes_and_delta_strikes():
         OptionSpec((Leg("P", otm=0.05, qty=-1.0),)),  # a premium package must cost > 0
         OptionSpec((Leg("P", otm=0.25, hold_months=2),)),  # held past its expiry
         OptionSpec((Leg("P", otm=0.05),), mode="overlay", roll_every_months=3),  # a 1-month put, quarterly rolls
+        OptionSpec((Leg("P", otm=0.05, strike_rule="round"),)),
+        OptionSpec((Leg("P", otm=0.05, strike_rule="floor", grid=0.0),)),
+        OptionSpec((Leg("P", otm=0.05, ref="noon"),)),
+        OptionSpec((PUT25,), settle="pm"),
     ],
 )
 def test_invalid_spec_raises(spec):

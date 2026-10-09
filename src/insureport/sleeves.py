@@ -12,7 +12,8 @@ Also T-bills (tbill_sleeve, AQR's "hold less equity"), a constant-maturity par-b
 (bond_proxy) and SPX time-series momentum (tsmom_sleeve).
 
 Pure numpy/pandas + pricing.py, no I/O. Panel columns as in data.load_market: spx, spxtr and
-the vol indices in index points, rf and q decimals. Cash accrues rf_{t-1} * calendar days / 360
+the vol indices in index points (plus spx_open, needed only by specs that strike or settle at the
+open), rf and q decimals. Cash accrues rf_{t-1} * calendar days / 360
 (portfolio.cash_returns); options are priced with r = ln(1 + rf).
 """
 
@@ -33,8 +34,12 @@ _VOLS = ("vix9d", "vix", "vix3m", "vix6m", "vix1y")  # pricing.var_swap_vol pill
 class Leg:
     """One option leg of a package, per unit of package notional.
 
-    cp "P" | "C". Strike at the open: otm -> K = S (1 - otm) for puts, S (1 + otm) for calls;
-    delta -> the |delta| strike from pricing.strike_for_delta (exactly one of otm / delta).
+    cp "P" | "C". Strike when the leg opens, off the reference level S_ref (ref "close": the row's
+    close, "open": its open, spx_open, the pre-11:00 level Cboe strikes off): otm -> K = S_ref (1 - otm)
+    for puts, S_ref (1 + otm) for calls; delta -> the |delta| strike from pricing.strike_for_delta at
+    S_ref (exactly one of otm / delta). strike_rule then snaps K to the grid (index points):
+    "continuous" keeps it, "floor" takes the largest grid multiple strictly below it (PPUT's "first
+    listed strike below 95%"), "ceil" the smallest at or above it (the CLL family, PPUT3M).
     expiry = third Friday of (open month + tenor_months) (option_sleeve shifts it with offset
     rolls); the leg is closed ceil(hold_months / roll_every_months) rolls after it opens (None =
     tenor_months, i.e. held to expiry). qty: + long / - short per unit of notional.
@@ -48,6 +53,9 @@ class Leg:
     hold_months: int | None = None
     qty: float = 1.0
     every_months: int = 1
+    strike_rule: str = "continuous"
+    grid: float = 5.0
+    ref: str = "close"
 
 
 @dataclass(frozen=True)
@@ -57,7 +65,9 @@ class OptionSpec:
     mode "premium": each roll spends premium_frac of the sleeve's cash on the package; "overlay":
     the sleeve holds the underlying and options on coverage x its value. monetize_mult: close and
     re-strike every leg once the long legs are worth monetize_mult x what they cost.
-    roll_every_months: roll on every N-th monthly roll date (third Fridays).
+    roll_every_months: roll on every N-th monthly roll date (third Fridays). settle: the S&P 500 level
+    an expiring leg pays intrinsic against, on its expiry trading day: "close" (PM settlement), or
+    "open" (spx_open, the proxy for Cboe's AM Special Opening Quotation).
     """
 
     legs: tuple[Leg, ...]
@@ -66,6 +76,7 @@ class OptionSpec:
     coverage: float = 1.0
     monetize_mult: float | None = None
     roll_every_months: int = 1
+    settle: str = "close"
 
 
 def third_friday(year: int, month: int) -> pd.Timestamp:
@@ -105,6 +116,8 @@ def _check(spec: OptionSpec) -> None:
         raise ValueError(f"monetize_mult must be > 1, got {spec.monetize_mult}")
     if not spec.legs or spec.roll_every_months < 1:
         raise ValueError("need at least one leg and roll_every_months >= 1")
+    if spec.settle not in ("close", "open"):
+        raise ValueError(f"settle must be 'close' or 'open', got {spec.settle!r}")
     for L in spec.legs:
         if L.cp not in ("P", "C") or (L.otm is None) == (L.delta is None):
             raise ValueError(f"{L}: cp must be 'P' or 'C' and exactly one of otm / delta set")
@@ -112,15 +125,30 @@ def _check(spec: OptionSpec) -> None:
             raise ValueError(f"{L}: need -1 < otm < 1 / 0 < |delta| < 1")
         if L.tenor_months < 1 or L.every_months < 1 or (L.hold_months is not None and L.hold_months < 1):
             raise ValueError(f"{L}: tenor_months, hold_months and every_months must be >= 1")
+        if L.strike_rule not in ("continuous", "floor", "ceil") or L.ref not in ("close", "open") or not L.grid > 0:
+            raise ValueError(f"{L}: need strike_rule continuous / floor / ceil, ref close / open and grid > 0")
         held = math.ceil((L.hold_months or L.tenor_months) / spec.roll_every_months) * spec.roll_every_months
         if held > L.tenor_months:
             raise ValueError(f"{L}: closed at the roll {held} months out, after its {L.tenor_months}-month expiry")
 
 
-def _inputs(mkt: pd.DataFrame) -> dict[str, np.ndarray]:
+def _snap(K: float, rule: str, grid: float) -> float:
+    """K on the strike grid: "floor" = the largest multiple of grid strictly below K, "ceil" = the
+    smallest at or above, "continuous" = K itself. K / grid is rounded to 9 decimals first, so a
+    target on the grid up to float noise counts as on it (2700 x 1.1 = 2970.0000000000005 -> ceil 2970)."""
+    # ponytail: fixed 5-pt grid; real listings are 5/10/25 pts by level
+    q = round(K / grid, 9)
+    if rule == "floor":
+        return grid * (math.ceil(q) - 1)
+    return grid * math.ceil(q) if rule == "ceil" else K
+
+
+def _inputs(mkt: pd.DataFrame, settle: str = "close") -> dict[str, np.ndarray]:
     """Per-row pricing inputs as arrays (r = ln(1 + rf); spx forward-filled), the row dates (`day`)
     and `eff`: the last row <= i whose inputs are usable (spx, skew, rf, q finite and at least one
     VIX pillar), -1 before the first; `stale` marks rows that borrow an earlier row's inputs.
+    `open`: spx_open, the row's spx where it is missing or <= 0 (or absent from mkt); `settle`: the
+    level expiring legs settle at, open or spx per the argument.
     DEVIATION from the brief ("any pricing input NaN" is a fallback): a row missing only some VIX
     pillars is usable, var_swap_vol interpolating over the rest, and is not counted.
     """
@@ -133,13 +161,19 @@ def _inputs(mkt: pd.DataFrame) -> dict[str, np.ndarray]:
     px["eff"] = np.maximum.accumulate(np.where(ok, i, -1))
     px["stale"] = px["eff"] != i
     px["spx"] = mkt["spx"].ffill().to_numpy(float)  # S is the row's own, carried only where spx itself is missing
+    o = mkt.get("spx_open", mkt["spx"]).to_numpy(float)
+    # ponytail: a missing open falls back to the close per row, silently (load_market's warnings count missing
+    # opens); count the roll / settle rows hit in attrs if a partial ^GSPC Open refresh ever bites
+    px["open"] = np.where(o > 0, o, px["spx"])  # NaN compares False: no open print, the row's close
+    px["settle"] = px["open"] if settle == "open" else px["spx"]
     px["day"] = mkt.index.to_numpy().astype("datetime64[D]")
     return px
 
 
 def _settle_row(day: np.ndarray, expiry: np.ndarray) -> np.ndarray:
-    """Row on whose close a leg expiring on `expiry` settles: the last trading day on or before it
-    (a Good Friday expiry settles at Thursday's close); len(day) when expiry is past the data."""
+    """Row on which a leg expiring on `expiry` settles (at its close or open, per OptionSpec.settle): the
+    last trading day on or before it (a Good Friday expiry settles on Thursday); len(day) when expiry is
+    past the data."""
     return np.where(expiry <= day[-1], np.searchsorted(day, expiry, side="right") - 1, len(day))
 
 
@@ -152,14 +186,16 @@ def _quotes(
     The model branch: pricing.quote (m, nu, h, z_cap passed on) at the row's S, T = (expiry -
     date)/365 and the vols, skew, r, q of the last usable row (_inputs `eff`: the row itself
     unless its inputs are unusable), vs = var_swap_vol(T, VIX pillars). From the settle row
-    (_settle_row) on, T = 0: the mid is the intrinsic value on the settle row's close, frozen.
+    (_settle_row) on, T = 0: the mid is the intrinsic value at the settle row's px["settle"] (its
+    close, or its open for AM settlement), frozen.
     Slice 9 adds the real-chain lookup here.
     """
-    # ponytail: PM settlement at the close, continuous strikes
+    # ponytail: the open stands in for the SOQ (the opening prints of all 500 stocks); EOD data has no SOQ
     settle = _settle_row(px["day"], expiry)
     d = np.minimum(day, settle)
     row = px["eff"][d]
     T = np.where(day >= settle, 0.0, (expiry - px["day"][d]).astype(float) / 365)
+    S = np.where(day >= settle, px["settle"][d], px["spx"][d])
     vs = pricing.var_swap_vol(T, *(px[c][row] for c in _VOLS))
     out = np.empty((3, len(day)))
     for cp in "PC":
@@ -167,7 +203,7 @@ def _quotes(
         if sel.any():
             r = row[sel]
             out[:, sel] = pricing.quote(
-                px["spx"][d[sel]], K[sel], T[sel], vs[sel], px["skew"][r], px["r"][r], px["q"][r], cp,
+                S[sel], K[sel], T[sel], vs[sel], px["skew"][r], px["r"][r], px["q"][r], cp,
                 m=m, nu=nu, h=h, z_cap=z_cap,
             )
     return out[0], out[1], out[2]
@@ -179,13 +215,13 @@ def _open_legs(
 ) -> list[dict]:
     """New legs from (open row, Leg, scheduled close row; len(panel) = past the data).
 
-    Strike from the open row's S (otm) or pricing.strike_for_delta (delta, at the row's S and the
-    last usable vols, skew, r, q). Expiry = third Friday of (M + tenor_months), M the month of the
-    row `offset` rows before the open (the un-shifted roll); with offset != 0 it then moves like
-    the rolls: snapped to the last row on or before it and shifted `offset` rows (past the data,
-    `offset` business days). Each leg carries its quotes `mid`, `bid`, `ask` (arrays, one entry
-    per row from its open to its close or the last row, all legs in ONE _quotes call) and
-    unit_cost = ask (long) / bid (short) on the open row.
+    Strike from the open row's S_ref (Leg.ref: its close or open) by otm, or pricing.strike_for_delta
+    (delta, at S_ref and the last usable vols, skew, r, q), snapped by Leg.strike_rule. Expiry = third
+    Friday of (M + tenor_months), M the month of the row `offset` rows before the open (the un-shifted
+    roll); with offset != 0 it then moves like the rolls: snapped to the last row on or before it and
+    shifted `offset` rows (past the data, `offset` business days). Each leg carries its quotes `mid`,
+    `bid`, `ask` (arrays, one entry per row from its open to its close or the last row, all legs in ONE
+    _quotes call) and unit_cost = ask (long) / bid (short) on the open row.
     """
     if not opens:
         return []
@@ -199,7 +235,7 @@ def _open_legs(
             j = int(np.searchsorted(day, expiry, side="right")) - 1 + offset
             expiry = (day[j] if expiry <= day[-1] and 0 <= j < n
                       else (pd.Timestamp(expiry) + pd.offsets.BDay(offset)).to_datetime64().astype("datetime64[D]"))
-        S, row = px["spx"][t], px["eff"][t]
+        S, row = px["open" if L.ref == "open" else "spx"][t], px["eff"][t]
         if L.otm is not None:
             K = S * (1 - L.otm if L.cp == "P" else 1 + L.otm)
         else:
@@ -209,6 +245,7 @@ def _open_legs(
             vs = float(pricing.var_swap_vol(T, *(px[c][row] for c in _VOLS)))
             args = (S, T, vs, px["skew"][row], px["r"][row], px["q"][row])
             K = pricing.strike_for_delta(*args, L.delta, L.cp, m=m, nu=nu, z_cap=z_cap)
+        K = _snap(K, L.strike_rule, L.grid)
         settle = int(_settle_row(px["day"], expiry))
         legs.append({"leg": L, "open": t, "close": close, "K": float(K), "expiry": expiry, "settle": settle,
                      "n": 0.0, "closed_on": None, "reason": None})
@@ -264,7 +301,11 @@ def option_sleeve(
     Quotes from pricing.quote via _quotes (m, nu, h, z_cap passed on; m, nu, z_cap also to
     strike_for_delta): marks at mid; opens at the ask (long) / bid (short); closes before expiry
     at the bid (long) / ask (short); from the last trading day on or before expiry the leg is
-    worth intrinsic on that day's close.
+    worth intrinsic on that day's close (spec.settle "close") or open ("open": spx_open, the
+    row's close where it is missing), either way before the roll's new legs open at the close.
+    Strikes per Leg (ref, strike_rule, grid). A spec that settles or strikes at the open needs an
+    spx_open column with at least one value > 0 (an all-missing open, e.g. a failed ^GSPC Open
+    fetch, would silently strike and settle every roll at the close).
     At a roll on row t: (1) close the legs due, proceeds to C, then monetize the legs held over
     the roll if they qualify (below); (2) NAV_pre, ret_t = NAV_pre / NAV_{t-1} - 1;
     (3) NAV_pre <= WIPED_OUT x NAV_post of the previous event (start: 1): ret_t = -1 exactly and
@@ -298,14 +339,18 @@ def option_sleeve(
     latest event, 0 before the first), fallback_quotes (int). attrs["legs"]: one dict per leg
     opened (size n != 0), by open date: open_date, close_date (scheduled; None past the data),
     expiry, cp, K, n, unit_cost, closed_on (None if still open), close_reason ("roll" | "expiry" |
-    "monetize" | None). pandas deep-copies attrs into every derived object (~50 ms per op on a
+    "monetize" | None), settle_px (the level it settled at; None unless it reached its expiry in
+    the data). pandas deep-copies attrs into every derived object (~50 ms per op on a
     9,000-day sleeve), so strip it before heavy arithmetic: r = df["ret"].copy(); r.attrs = {}.
     Raises ValueError on an invalid spec or a premium package that costs <= 0.
     """
     _check(spec)
+    needs_open = spec.settle == "open" or any(L.ref == "open" for L in spec.legs)
+    if needs_open and ("spx_open" not in mkt or not (mkt["spx_open"] > 0).any()):
+        raise ValueError("the spec settles or strikes at the open: mkt needs spx_open values")
     if "ts_filled" not in mkt:
         mkt = pricing.fill_term_structure(mkt)
-    px, n, kw = _inputs(mkt), len(mkt), {"m": m, "nu": nu, "h": h, "z_cap": z_cap}
+    px, n, kw = _inputs(mkt, spec.settle), len(mkt), {"m": m, "nu": nu, "h": h, "z_cap": z_cap}
     premium = spec.mode == "premium"
     ev = mkt.index.get_indexer(roll_dates(mkt.index, spec.roll_every_months, offset_bdays))
     ev = ev[px["eff"][ev] >= 0].tolist()
@@ -341,9 +386,9 @@ def option_sleeve(
             # ponytail: ret is a double. Under a flat or near-flat put wing a far-OTM put held to expiry at f ~ 1
             # marks below 1e-16 of the day before in the last ~4 trading days at VIX <= 15, ret rounds to -1, and a
             # gain or crash payoff in expiry week is lost to compounding (test_expiry_week_payoff_is_lost_to_return_
-            # rounding). The default linear wing (m 0.3) keeps such marks alive at SKEW >~ 106; a finite z_cap or a
-            # near-flat smile (SKEW <~ 105, as in 1996-97) still rounds ret to -1. Add a NAV column (or have the
-            # engine read sleeve NAV levels) if hold-to-expiry premium presets are used.
+            # rounding). The default linear wing (m = SKEW_MULT 0.2) keeps such marks alive at SKEW >~ 107; a finite
+            # z_cap or a near-flat smile (SKEW <~ 106, as in 1996-97) still rounds ret to -1. Add a NAV column (or
+            # have the engine read sleeve NAV levels) if hold-to-expiry premium presets are used.
             with np.errstate(divide="ignore", invalid="ignore"):
                 base = np.r_[nav, navs[:-1]]
                 ret[days] = np.where(base > 0, navs / base - 1, 0.0)  # no capital, no return
@@ -425,6 +470,8 @@ def option_sleeve(
             "unit_cost": g["unit_cost"],
             "closed_on": None if g["closed_on"] is None else date[g["closed_on"]],
             "close_reason": g["reason"],
+            "settle_px": (float(px["settle"][g["settle"]]) if g["settle"] < n
+                          and (g["closed_on"] is None or g["closed_on"] >= g["settle"]) else None),
         }
         for g in sorted(legs, key=lambda g: g["open"])
     ]

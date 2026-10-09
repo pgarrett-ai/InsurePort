@@ -22,7 +22,7 @@ from scipy.optimize import brentq
 from scipy.special import erfcx, ndtr
 from scipy.stats import norm
 
-SKEW_MULT: float = 0.3  # calibrated on PPUT 1990-2015 (scripts/calibrate.py; replicate.calibrate_skew)
+SKEW_MULT: float = 0.3  # anchored to the observed SPX smile slope: IV/vs = 0.968 + 0.263 z at SKEW 149.19 (docs/research/gap-3-q9 A), i.e. m = 0.263 * 6 / 4.919 = 0.32; PPUT replication validates it (scripts/calibrate.py)
 HALF_SPREAD_MIN: float = 0.05  # SPX index points (the minimum tick)
 PILLARS_DAYS = (9, 30, 93, 184, 365)  # VIX9D, VIX, VIX3M, VIX6M, VIX1Y (Cboe's target tenors)
 Z_CAP: float = np.inf  # standardized moneyness past which the put wing goes flat: never, by default

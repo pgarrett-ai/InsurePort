@@ -1,9 +1,10 @@
 """Tests for insureport.data: the Cboe and FRED CSV parsers, the parquet cache (fresh hit,
 20 h refresh, stale fallback, empty fallback, duplicate dates, corrupt file, unwritable dir),
-the network seams (offline guard, request headers, yfinance call and post-processing), prices()
-normalising and dropping tickers, load_market() panel assembly (calendar, source mapping incl. the
-VIX1Y pillar, ffill limit, rf scaling, the dividend yield q with its clip and TR gaps, required-series
-errors) and the committed fixture's columns.
+the network seams (offline guard, request headers, yfinance call and post-processing, the Open
+field), prices() normalising and dropping tickers, load_market() panel assembly (calendar, source
+mapping incl. the VIX1Y pillar and the S&P 500 open, ffill limit and the unfilled open, rf scaling,
+the dividend yield q with its clip and TR gaps, required-series errors, a failed Open fetch reported)
+and the committed fixture's columns.
 
 Why: every later module trusts this panel. All network I/O goes through the two seams
 (_yf_download, _http_text), which are monkeypatched here with synthetic series, so the
@@ -205,6 +206,7 @@ def test_seam_bodies_with_stubbed_transport(monkeypatch):
     assert seen["yf"][1]["auto_adjust"] is True and seen["yf"][1]["start"] == "2020-01-01"
     assert df.index.tz is None and list(df.columns) == ["^GSPC", "ZZZ"]
     assert df["^GSPC"].tolist() == [1.0, 2.0] and df["ZZZ"].isna().all()
+    assert data._yf_download(["^GSPC"], "2020-01-01", "Open")["^GSPC"].tolist() == [9.0, 9.0]  # the spx_open field
 
 
 def test_prices_drops_missing_tickers(tmp_path, monkeypatch, caplog):
@@ -254,12 +256,14 @@ CBOE = {
     "CLL": pd.Series(400.0, IDX),
 }  # VXTH deliberately absent: its fetch fails
 YF = {"^GSPC": PX, "^SP500TR": pd.concat([TR, SAT]), "^VIX3M": pd.Series(22.0, IDX)}
+OPEN = (0.999 * PX).drop(IDX[50])  # ^GSPC Open; no print on row 50
 
 
 def _fake_sources(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, drop: frozenset[str] | set[str] = frozenset()
 ) -> None:
-    """Point both seams at the synthetic series above; any key in `drop` fails to fetch."""
+    """Point both seams at the synthetic series above; any key in `drop` fails to fetch ("^GSPC_open": the
+    ^GSPC Open field alone)."""
     monkeypatch.setenv("INSUREPORT_DATA_DIR", str(tmp_path))
     texts = {  # URL literals from the brief, so a typo in data.CBOE_URL / FRED_URL fails here
         f"https://cdn.cboe.com/api/global/us_indices/daily_prices/{k}_History.csv": f"DATE,{k}\n"
@@ -272,7 +276,10 @@ def _fake_sources(
         texts["https://fred.stlouisfed.org/graph/fredgraph.csv?id=DTB3"] = "observation_date,DTB3\n" + rows
     monkeypatch.setattr(data, "_http_text", lambda url: texts[url])  # KeyError = failed fetch
     monkeypatch.setattr(
-        data, "_yf_download", lambda tickers, start: pd.DataFrame({t: YF[t] for t in tickers if t not in drop})[tickers]
+        data, "_yf_download",
+        lambda tickers, start, field="Close": pd.DataFrame(  # any other field: KeyError, a failed fetch
+            {t: {"Close": YF, "Open": {"^GSPC": OPEN}}[field][t] for t in tickers
+             if (t if field == "Close" else t + "_open") not in drop})[tickers],
     )
 
 
@@ -280,10 +287,12 @@ def test_load_market_panel(tmp_path, monkeypatch):
     _fake_sources(monkeypatch, tmp_path)
     m = data.load_market("1999-01-01")
     assert list(m.columns) == [
-        "spx", "spxtr", "vix", "vix9d", "vix3m", "vix6m", "vix1y", "skew", "rf", "q", "pput", "cll", "vxth"
+        "spx", "spx_open", "spxtr", "vix", "vix9d", "vix3m", "vix6m", "vix1y", "skew", "rf", "q", "pput", "cll", "vxth"
     ]
     assert m.index.equals(IDX)  # ^GSPC days only: Saturday VIX, SKEW, TR and DTB3 prints add no row
     assert np.allclose(m["spx"], PX)
+    # the ^GSPC Open, not forward-filled: a stale open must not settle or strike a roll (sleeves use the close)
+    assert np.allclose(m["spx_open"].drop(IDX[50]), OPEN) and np.isnan(m["spx_open"].iloc[50])
     # each column comes from its own source (m.skew would be the DataFrame method, hence item access)
     assert (m["vix3m"] == 22).all() and (m["vix6m"] == 23).all() and (m["skew"] == 120).all()
     assert (m["pput"] == 500).all() and (m["cll"] == 400).all()
@@ -301,6 +310,7 @@ def test_load_market_panel(tmp_path, monkeypatch):
     # optional series that failed is NaN and reported; partial ones are reported too
     assert m["vxth"].isna().all()
     assert m.attrs["warnings"] == [
+        "spx_open: 1 of 600 rows missing (data from 2000-01-03)",
         "spxtr: 100 of 600 rows missing (data from 2000-05-22)",  # TR starts at IDX[100]
         "vix: 1 of 600 rows missing (data from 2000-01-03)",
         "vix9d: 300 of 600 rows missing (data from 2001-02-26)",  # IDX[300]
@@ -346,8 +356,18 @@ def test_load_market_missing_required_raises(tmp_path, monkeypatch, drop, name):
         data.load_market("1999-01-01")
 
 
+def test_load_market_without_the_open(tmp_path, monkeypatch):
+    # the ^GSPC Open fetch fails, the close does not: spx_open is all NaN and reported (sleeves then refuse to
+    # strike or settle at the open rather than silently use the close)
+    _fake_sources(monkeypatch, tmp_path, drop={"^GSPC_open"})
+    m = data.load_market("1999-01-01")
+    assert m["spx_open"].isna().all() and np.allclose(m["spx"], PX)
+    assert "spx_open: no data" in m.attrs["warnings"]
+
+
 def test_fixture_has_the_panel_columns():
-    # the committed 2018-2019 fixture is a load_market slice: the 13 columns, VIX1Y included and complete
+    # the committed 2018-2019 fixture is a load_market slice: the 14 columns, VIX1Y and the open included and complete
     fx = pd.read_csv(Path(__file__).parent / "fixtures" / "market_2018_2019.csv", index_col="date", parse_dates=True)
-    assert list(fx.columns) == data.COLUMNS
-    assert fx["vix1y"].notna().all() and len(fx) == 503
+    assert list(fx.columns) == data.COLUMNS and len(fx.columns) == 14
+    assert fx[["vix1y", "spx_open"]].notna().all().all() and len(fx) == 503
+    assert (fx["spx_open"] != fx["spx"]).mean() > 0.95  # the Open field, not the close again

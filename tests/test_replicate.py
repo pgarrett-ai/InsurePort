@@ -1,17 +1,24 @@
 """Tests for insureport.replicate: tracking metrics (identical series, hand values on three
-monthly returns sampled at month-end, the roll-day / non-roll-day split, stale prints dropped),
-Cboe's roll calendar on the Juneteenth 2026 holiday, the PPUT / CLL / PPUT3M replicas on the
-2018-2019 fixture panel (aligned, scaled to the real index on the first common date, the quarterly
-put on the Mar/Jun/Sep/Dec cycle), the smile and fill knobs reaching the replica and the table,
-the validation table, its pass flags, a neutralised splice and too-short windows, a regression pin
-of PPUT tracking with the committed pricing.SKEW_MULT, the calibration grid (lowest TE within the
-PPUT CAGR tolerance, else lowest TE, ties to the smaller |dCAGR|; slope-cap share; nothing after
-train_end used) and unknown targets.
+monthly returns sampled at month-end, TE without the months of bad marks, the roll-day /
+non-roll-day split, stale prints dropped), Cboe's roll calendar on the Juneteenth 2026 holiday, the
+PPUT / CLL / PPUT3M replicas on the 2018-2019 fixture panel (aligned, scaled to the real index on
+the first common date, the quarterly put on the Mar/Jun/Sep/Dec cycle), the slice-5 ("naive")
+conventions reproduced, the Cboe conventions of all three replicas (listed strikes off the open,
+settlement at the open, which alone moves roll days only; no open values, no Cboe replica), the
+1990-2015 fill cost per option per roll (both bounds of the window; an ask FILL_ADD over a non-zero
+mid), the smile and convention knobs reaching the replica and the table, validate passing conventions
+and fill on and calibrate_skew running on replicate's Cboe defaults, the validation table (its pass flags, the run
+settings, the CLL bad-mark flag), a neutralised splice and too-short windows, a regression pin of
+PPUT tracking with the committed pricing.SKEW_MULT, the calibration grid (lowest TE within the PPUT
+CAGR tolerance, else lowest TE, ties to the smaller |dCAGR|; slope-cap share; nothing after
+train_end used) and unknown targets and settings.
 
 Why: the replicas are the pricer's only check against traded-option strategy indices, and the
 calibrated SKEW_MULT feeds every option sleeve. Committed fixture CSV plus synthetic series, no I/O.
 """
 
+import dataclasses
+import inspect
 from pathlib import Path
 
 import numpy as np
@@ -52,7 +59,10 @@ def test_tracking_hand_values():
     # hedge P&Ls s - b = (-0.01, 0.0193223, -0.0202970), a - b = (-0.02, 0.0390272, -0.0401961);
     # corr(synth, actual) without the bench would be -0.2301
     assert t["corr"] == pytest.approx(0.9999858, abs=1e-6)
-    assert t["n_months"] == 3
+    assert t["n_months"] == 3 and t["te_ex_bad"] == t["te"]  # no bad marks
+    # a bad mark in March drops the March return (Feb-end to Mar-end) from te_ex_bad: std(0.01, 0.0198990) sqrt(12)
+    bad = replicate.tracking(synth, actual, bench, bad=pd.DatetimeIndex(["2019-03-15"]))
+    assert bad["te_ex_bad"] == pytest.approx(0.0242476, abs=1e-7) and bad["te"] == t["te"]
 
 
 def test_tracking_splits_roll_days_from_the_rest():
@@ -97,22 +107,141 @@ def test_replicate_is_aligned_and_scaled_to_the_real_index(which):
 
 def test_knobs_reach_the_replica_and_the_table():
     kw = {"m": 0.7, "nu": 1.2, "h": 0.05, "z_cap": 2.5}
-    nav = metrics.nav_from_returns(sleeves.option_sleeve(MKT, replicate.PPUT_SPEC, **kw)["ret"])
-    assert replicate.replicate(MKT, "PPUT", **kw).to_numpy() == pytest.approx(
-        (nav * MKT["pput"].iloc[0]).to_numpy(), rel=1e-12)
+    for conv in ("cboe", "naive"):  # the fixture is after 2015: the cboe fill is the mid, no add-on
+        nav = metrics.nav_from_returns(sleeves.option_sleeve(MKT, replicate.SPECS[conv]["PPUT"], **kw)["ret"])
+        assert replicate.replicate(MKT, "PPUT", conventions=conv, **kw).to_numpy() == pytest.approx(
+            (nav * MKT["pput"].iloc[0]).to_numpy(), rel=1e-12)
     w = {"PPUT": ("2018-01-01", None)}
     base = replicate.validate(MKT, windows=w).loc["PPUT", ["te", "dcagr"]]
-    for k, v in kw.items():  # each knob alone moves the table
+    for k, v in (kw | {"conventions": "naive"}).items():  # each knob alone moves the table
         assert not np.allclose(replicate.validate(MKT, windows=w, **{k: v}).loc["PPUT", ["te", "dcagr"]], base,
                                rtol=1e-9, atol=0)
+
+
+def test_naive_conventions_reproduce_slice_5():
+    """conventions="naive" is the slice-5 replica (strikes 0.95 / 0.90 / 1.10 x the close, continuous,
+    settled at the close); the default cboe fill is the mid after 2015. Levels pinned from the pre-5b code
+    (slice-5 conventions on the slice-3c linear-wing pricer with the VIX1Y pillar) on this fixture at
+    SKEW_MULT 0.3."""
+    mkt = MKT.assign(pput3m=(MKT["spxtr"] / 60).where(MKT.index >= "2018-06-01"))
+    pins = {
+        "PPUT": {"2018-02-09": 844.7875855550132, "2018-12-24": 785.3898217654562, "2019-12-31": 1030.005626387901},
+        "CLL": {"2018-06-29": 794.9640789772856, "2018-12-24": 785.3062561400677, "2019-12-31": 1010.3601034011399},
+        "PPUT3M": {"2018-06-29": 89.51158345449845, "2018-12-24": 84.75928959033531, "2019-12-31": 113.91488318342678},
+    }
+    for which, vals in pins.items():
+        s = replicate.replicate(mkt, which, conventions="naive", m=0.3)
+        assert s[list(vals)].tolist() == pytest.approx(list(vals.values()), rel=1e-12)
+
+
+@pytest.mark.parametrize("which,unsettled", [("PPUT", 1), ("PPUT3M", 1), ("CLL", 2)])
+def test_cboe_conventions_strike_and_settle_at_the_open(which, unsettled):
+    # PPUT: the largest 5-point strike strictly below 95% of the roll day's open; PPUT3M (90%) and CLL (put 95%,
+    # call 110%): the smallest at or above; every expiring leg settles at its expiry day's open
+    mkt = MKT if which == "PPUT" else MKT.loc[FIRST_QUARTERLY_ROLL:]
+    legs = sleeves.option_sleeve(mkt, replicate.SPECS["cboe"][which], h=0.0).attrs["legs"]
+    for g in legs:
+        mult = 1.10 if g["cp"] == "C" else {"PPUT": 0.95, "PPUT3M": 0.90, "CLL": 0.95}[which]
+        target = mult * MKT.at[g["open_date"], "spx_open"]
+        lo, hi = (target - 5, target) if which == "PPUT" else (target, target + 5)
+        assert g["K"] % 5 == 0 and lo <= g["K"] < hi
+        assert g["settle_px"] in (None, MKT.loc[: g["expiry"], "spx_open"].iloc[-1])
+    # the fixture's opens differ from its closes, so a close-settled leg fails the line above; the last put (and
+    # CLL's last call) expire after the data
+    assert sum(g["settle_px"] is not None for g in legs) == len(legs) - unsettled > 0
+    # no open values (a failed ^GSPC Open fetch): the Cboe replica raises rather than strike and settle at the close
+    with pytest.raises(ValueError, match="spx_open"):
+        replicate.replicate(MKT.assign(spx_open=np.nan, pput3m=MKT["spxtr"] / 60), which)
+
+
+def test_settling_at_the_open_moves_roll_days_only():
+    # DEVIATION from the brief (cboe differs on roll days only; see the replicate module docstring): settling
+    # at the open alone moves the roll days only, the expiring put's payoff changing NAV_pre and the same
+    # package being re-sized from it (returns are scale-free). The Cboe PPUT spec against itself settled at
+    # the close: same listed strikes off the open, so the marks between rolls match
+    cboe = replicate.SPECS["cboe"]["PPUT"]
+    a = sleeves.option_sleeve(MKT, cboe, h=0.0)["ret"]
+    b = sleeves.option_sleeve(MKT, dataclasses.replace(cboe, settle="close"), h=0.0)["ret"]
+    on = MKT.index.isin(sleeves.roll_dates(MKT.index))
+    assert (a - b)[~on].abs().max() < 1e-12 and (a - b)[on].abs().max() > 1e-3  # Dec 2018: the put finished ITM
+
+
+def _flat(start: str, end: str, S: float = 2000.0) -> pd.DataFrame:
+    """A flat business-day panel from start to end: S, open, TR and the real levels at S, every VIX
+    pillar 0 (each option is worth its intrinsic value, 0 here), SKEW 130, rf = q = 0."""
+    idx = pd.bdate_range(start, end)
+    df = pd.DataFrame({"spx": S, "spx_open": S, "spxtr": S, "skew": 130.0, "rf": 0.0, "q": 0.0, "pput": S, "cll": S},
+                      index=idx)
+    for c in sleeves._VOLS:
+        df[c] = 0.0
+    return df
+
+
+@pytest.mark.parametrize("start,end,charged", [("2015-09-01", "2016-03-31", 4), ("1989-09-01", "1990-03-31", 3)])
+@pytest.mark.parametrize("which,opened", [("PPUT", (1, 1, 1, 1, 1, 1, 1)), ("CLL", (0, 1, 1, 2, 1, 1, 2))])
+def test_cboe_fill_costs_030_points_per_option_per_roll_1990_2015(which, opened, start, end, charged):
+    """Each 1990-2015 roll lowers the level by FILL_ADD (0.30) points per option opened per index unit
+    held (level / S units at zero option value); rolls before 1990 (fill = the 4 pm mark) and after 2015
+    (the mid) cost nothing. opened = options opened on the Sep..Mar rolls, `charged` of them inside
+    FILL_ADD_DATES (Sep..Dec 2015, Jan..Mar 1990); CLL starts on September's (scaled there, cost unseen)."""
+    S, mkt = 2000.0, _flat(start, end)
+    mid, cboe = (replicate.replicate(mkt, which, fill=f) for f in ("mid", "cboe"))
+    assert (mid.dropna() == S).all() and replicate.FILL_ADD == 0.30  # options at 0: the mid replica is flat
+    rolls = sleeves.roll_dates(mkt.index)
+    inside = (rolls >= "1990-01-01") & (rolls <= "2015-12-31")
+    assert len(rolls) == 7 and inside.sum() == charged
+    paid = np.array(opened) * inside
+    cut = (-cboe.diff()).reindex(rolls).fillna(0.0)  # CLL's first date has no level before it
+    np.testing.assert_allclose(cut, 0.30 * paid * cboe[rolls] / S, rtol=1e-12, atol=1e-12)
+    assert (cboe.diff().drop(rolls).dropna() == 0).all()  # no cost off the rolls
+    assert mid.iloc[-1] - cboe.iloc[-1] == pytest.approx(0.30 * paid.sum(), rel=1e-3)  # about 1 unit per index
+
+
+def test_cboe_fill_is_an_ask_030_points_over_a_nonzero_mid(monkeypatch):
+    """On a single-leg overlay the add-on is exactly an ask of mid + FILL_ADD (replicate._fill_cost): with the
+    fill window over the fixture, the cboe-fill PPUT equals a mid-fill PPUT whose quotes put the ask FILL_ADD
+    over the mid, on every day but the rolls (the add-on is charged on the roll, the quoted ask the day after)."""
+    monkeypatch.setattr(replicate, "FILL_ADD_DATES", ("2018-01-01", "2019-12-31"))
+    cboe, mid = (replicate.replicate(MKT, "PPUT", fill=f) for f in ("cboe", "mid"))
+    assert mid.iloc[-1] - cboe.iloc[-1] > 1  # the add-on is not negligible here
+    quote = pricing.quote
+
+    def wide(*a, **kw):
+        mid = quote(*a, **kw)[0]
+        return mid, mid - replicate.FILL_ADD, mid + replicate.FILL_ADD
+
+    monkeypatch.setattr(pricing, "quote", wide)
+    ask = replicate.replicate(MKT, "PPUT", fill="mid")
+    off = ~MKT.index.isin(sleeves.roll_dates(MKT.index))
+    np.testing.assert_allclose(cboe[off], ask[off], rtol=1e-12)
+
+
+def test_validate_passes_conventions_and_fill_on_and_calibrate_skew_uses_the_cboe_defaults(monkeypatch):
+    """The fixture is after 2015, where the cboe fill is the mid, so the calls are recorded: validate passes
+    conventions and fill on; calibrate_skew leaves both at replicate's defaults, Cboe conventions and fill,
+    the setting the committed SKEW_MULT was calibrated under."""
+    seen, real = [], replicate.replicate
+    monkeypatch.setattr(replicate, "replicate", lambda *a, **kw: seen.append(kw) or real(*a, **kw))
+    runs = [("naive", "mid"), ("cboe", "cboe")]
+    for conv, fill in runs:
+        replicate.validate(MKT, windows={"PPUT": ("2018-01-01", None)}, conventions=conv, fill=fill)
+    assert [(kw["conventions"], kw["fill"]) for kw in seen] == runs
+    seen.clear()
+    replicate.calibrate_skew(MKT, m_grid=[0.3, 0.5], train_end="2019-12-31")
+    assert len(seen) == 2 and not any({"conventions", "fill"} & set(kw) for kw in seen)
+    p = inspect.signature(real).parameters
+    assert p["conventions"].default == "cboe" and p["fill"].default == "cboe"
 
 
 def test_validate_table_and_flags():
     v = replicate.validate(MKT, windows={"PPUT": ("2018-01-01", None), "CLL": ("2018-01-01", None)})
     assert v.index.tolist() == ["PPUT", "CLL"]
     assert {"window_start", "window_end", "te", "dcagr", "corr", "dmaxdd", "n_months", "te_roll", "te_nonroll",
-            "te_ok", "dcagr_ok", "corr_ok", "passed"} <= set(v.columns)
+            "te_ex_bad", "bad_marks", "conventions", "fill", "z_cap", "te_ok", "dcagr_ok", "corr_ok",
+            "passed"} <= set(v.columns)
     assert v[["te_roll", "te_nonroll"]].notna().all().all()
+    assert (v["conventions"] == "cboe").all() and (v["fill"] == "cboe").all() and (v["z_cap"] == pricing.Z_CAP).all()
+    assert (v["bad_marks"] == "").all() and (v["te_ex_bad"] == v["te"]).all()  # the CLL bad marks are in 2020
     for which, row in v.iterrows():
         tol = replicate.TOLERANCE[which]
         assert row["te_ok"] == (row["te"] <= tol["te"]) and row["corr_ok"] == (row["corr"] >= tol["corr"])
@@ -136,6 +265,18 @@ def test_validate_rejects_windows_without_three_month_ends(window):
         replicate.validate(MKT, windows={"PPUT": window})
 
 
+def test_validate_flags_bad_marks(monkeypatch):
+    assert replicate.BAD_MARKS == {"CLL": ("2020-02-28", "2020-03-02")}  # addendum section 13
+    w = {"PPUT": ("2018-01-01", None), "CLL": ("2018-01-01", None)}
+    clean = replicate.validate(MKT, windows=w, conventions="naive", z_cap=3.0)
+    monkeypatch.setitem(replicate.BAD_MARKS, "CLL", ("2019-02-28", "2019-03-04", "2021-01-04"))  # last: off the panel
+    v = replicate.validate(MKT, windows=w, conventions="naive", z_cap=3.0)
+    assert v.at["CLL", "bad_marks"] == "2019-02-28, 2019-03-04" and v.at["PPUT", "bad_marks"] == ""
+    assert v.at["PPUT", "te_ex_bad"] == v.at["PPUT", "te"] and v.at["CLL", "te_ex_bad"] != v.at["CLL", "te"]
+    assert v.at["CLL", "te"] == clean.at["CLL", "te"]  # flagged, not removed from te
+    assert (v["conventions"] == "naive").all() and (v["z_cap"] == 3.0).all()
+
+
 def test_validate_neutralises_a_splice(monkeypatch):
     w, d = {"CLL": ("2018-01-01", None)}, "2019-06-03"
     stepped = MKT.assign(cll=MKT["cll"] * np.where(MKT.index < d, 1.25, 1.0))  # a -20% step with no market move
@@ -146,34 +287,30 @@ def test_validate_neutralises_a_splice(monkeypatch):
 
 
 def test_pput_tracking_regression_pin():
-    """PPUT on the 2018-2019 fixture at SKEW_MULT = 0.3 (h = 0): te = 0.0112, dcagr = +0.0092,
-    corr = 0.986 (23 months). Pinned loosely with the committed pricing.SKEW_MULT: te within 2x
-    the out-of-sample TE tolerance, |dcagr| <= 1%/yr. The other selection rules miss the pin:
-    dcagr +0.0149 at m 0.2 (argmin |dcagr|), -0.0295 at m 1.0 (argmin te alone)."""
+    """PPUT on the 2018-2019 fixture at the committed SKEW_MULT = 0.3 (anchored to the observed market smile
+    slope, not fitted to PPUT), Cboe conventions and fill (h = 0): te = 0.01045, dcagr = -0.00797,
+    corr = 0.98568 (23 months); slice 5 (naive, m 0.3) had te 0.0112, dcagr +0.0092. Loose bound: te within
+    2x the out-of-sample TE tolerance, |dcagr| <= 1%/yr."""
     t = replicate.tracking(replicate.replicate(MKT, "PPUT"), MKT["pput"], MKT["spxtr"])
     assert t["te"] <= 2 * replicate.TOLERANCE["PPUT"]["te"] and abs(t["dcagr"]) <= 0.01
+    assert (t["te"], t["dcagr"], t["corr"]) == pytest.approx((0.01045, -0.00797, 0.98568), abs=1e-5)
 
 
 def test_calibrate_skew_marks_one_best(monkeypatch):
-    """best = the lowest te among the m within the PPUT CAGR tolerance, the lowest te overall when
-    no m is within it, ties to the smaller |dcagr|."""
-    g = replicate.calibrate_skew(MKT, m_grid=[0.3, 0.5, 0.7], train_end="2019-12-31")
-    assert g.index.tolist() == [0.3, 0.5, 0.7] and g["best"].sum() == 1
+    """best = the m with the smallest |dcagr| on the training panel, ties to the lower te."""
+    g = replicate.calibrate_skew(MKT, m_grid=[0.2, 0.5, 0.7], train_end="2019-12-31")
+    assert g.index.tolist() == [0.2, 0.5, 0.7] and g["best"].sum() == 1
     assert {"te", "dcagr", "corr", "cap_share"} <= set(g.columns)
     # the slope cap binds above SKEW 100 + 60 c* / m, c* the 30 d cap at the day's VIX (0.39 .. 0.64 on the
-    # fixture, median 0.46: SKEW 155 at m 0.5, 140 at m 0.7): never at m 0.3, 5 days at m 0.5, 99 at m 0.7
+    # fixture, median 0.46: SKEW 155 at m 0.5, 140 at m 0.7): never at m 0.2, 5 days at m 0.5, 99 at m 0.7
     assert g["cap_share"].tolist() == pytest.approx([0, 5 / len(MKT), 99 / len(MKT)])
-    ok = g[g["dcagr"].abs() <= replicate.TOLERANCE["PPUT"]["dcagr"]]
-    assert g["te"].idxmin() not in ok.index  # the fixture separates the two rules
-    assert g.loc[g["best"], "te"].iloc[0] == ok["te"].min()
-    monkeypatch.setitem(replicate.TOLERANCE, "PPUT", {**replicate.TOLERANCE["PPUT"], "dcagr": 0.0})
+    assert g.index[g["best"]].tolist() == [g["dcagr"].abs().idxmin()]
+    monkeypatch.setattr(replicate, "replicate", lambda mkt, which, **kw: kw["m"])  # tracking sees m as the synth
+    monkeypatch.setattr(replicate, "tracking", lambda m, a, b: {"te": {0.3: 0.02, 0.5: 0.01, 0.7: 0.03}[m],
+                                                                "dcagr": {0.3: 0.002, 0.5: -0.002, 0.7: 0.003}[m],
+                                                                "corr": 1.0})
     g = replicate.calibrate_skew(MKT, m_grid=[0.3, 0.5, 0.7], train_end="2019-12-31")
-    assert g.loc[g["best"], "te"].iloc[0] == g["te"].min() and g["best"].sum() == 1
-    monkeypatch.setattr(replicate, "replicate", lambda mkt, which, m, h: m)  # tracking sees m as the synth
-    monkeypatch.setattr(replicate, "tracking", lambda m, a, b: {"te": 0.01, "dcagr": {0.3: 0.004, 0.5: -0.002,
-                                                                                        0.7: 0.003}[m], "corr": 1.0})
-    g = replicate.calibrate_skew(MKT, m_grid=[0.3, 0.5, 0.7], train_end="2019-12-31")
-    assert g.index[g["best"]].tolist() == [0.5]  # a three-way te tie
+    assert g.index[g["best"]].tolist() == [0.5]  # |dcagr| tie between 0.3 and 0.5 goes to the lower te
 
 
 def test_calibrate_skew_ignores_data_after_train_end():
@@ -188,3 +325,7 @@ def test_unknown_target_raises():
         replicate.replicate(MKT, "TAIL")
     with pytest.raises(ValueError, match="pput3m"):  # no real PPUT3M series in the panel to scale to
         replicate.replicate(MKT, "PPUT3M")
+    with pytest.raises(ValueError, match="conventions"):
+        replicate.replicate(MKT, "PPUT", conventions="am")
+    with pytest.raises(ValueError, match="fill"):
+        replicate.replicate(MKT, "PPUT", fill="ask")
