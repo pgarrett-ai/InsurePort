@@ -12,16 +12,24 @@ import pandas as pd
 
 from insureport.portfolio import Portfolio
 
+# Harvey et al. (2019)'s eight S&P 500 drawdowns over 15% (1985-2018), COVID, the 2022 grind and the 2025 tariff
+# shock (addendum D14)
 CRASHES: dict[str, tuple[str, str]] = {
     "1987 Black Monday": ("1987-08-25", "1987-12-04"),
     "1990 Gulf War": ("1990-07-16", "1990-10-11"),
     "1998 LTCM": ("1998-07-17", "1998-10-08"),
     "2000-02 Dot-com": ("2000-03-24", "2002-10-09"),
     "2007-09 GFC": ("2007-10-09", "2009-03-09"),
+    "2010 Flash crash": ("2010-04-23", "2010-07-02"),
     "2011 Debt ceiling": ("2011-04-29", "2011-10-03"),
     "2018 Q4": ("2018-09-20", "2018-12-24"),
     "2020 COVID": ("2020-02-19", "2020-03-23"),
     "2022 Rates": ("2022-01-03", "2022-10-12"),
+    "2025 Tariff shock": ("2025-02-19", "2025-04-08"),
+}
+# drawdown speed (D14: puts win fast crashes, lose slow grinds): "fast" when the window spans at most 6 months
+CRASH_SPEED: dict[str, str] = {
+    k: "fast" if (pd.Timestamp(e) - pd.Timestamp(s)).days <= 183 else "slow" for k, (s, e) in CRASHES.items()
 }
 
 
@@ -99,7 +107,7 @@ def longest_recovery_days(nav: pd.Series) -> int:
     return int(span[under].max().days)
 
 
-def _window_return(level: pd.Series, start: pd.Timestamp, end: pd.Timestamp) -> float:
+def window_return(level: pd.Series, start: pd.Timestamp, end: pd.Timestamp) -> float:
     """level(last date <= end) / level(first date >= start) - 1; NaN unless [start, end] lies inside level's dates."""
     level = level.dropna()
     if level.empty or start < level.index[0] or end > level.index[-1]:
@@ -122,9 +130,9 @@ def crash_returns(
     rows = {}
     for name, (s, e) in crashes.items():
         start, end = pd.Timestamp(s), pd.Timestamp(e)
-        ret = _window_return(nav, start, end)
+        ret = window_return(nav, start, end)
         if not np.isnan(ret):
-            rows[name] = [start, end, ret, np.nan if bench is None else _window_return(bench, start, end)]
+            rows[name] = [start, end, ret, np.nan if bench is None else window_return(bench, start, end)]
     return pd.DataFrame.from_dict(rows, orient="index", columns=["start", "end", "ret", "bench_ret"])
 
 

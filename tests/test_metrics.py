@@ -1,9 +1,10 @@
 """Tests for insureport.metrics: NAV from returns, CAGR on calendar days, annualized volatility,
 calendar-year returns, the volatility tax (the +50% / -50% example and the two-point lognormal
 closed form against its variance / 2 approximation), drawdown, time under water and the longest
-recovery span, OLS beta and downside beta, crash-window returns (end over start, off-calendar
-boundaries, sparse NAVs), concentration, hedge notional, and diagnose() on the 2018-2019 fixture
-panel (every value wired to its function, p.value, the window shared with the S&P 500).
+recovery span, OLS beta and downside beta, the crash-window library and its fast / slow tags,
+crash-window returns (end over start, off-calendar boundaries, sparse NAVs), concentration, hedge
+notional, and diagnose() on the 2018-2019 fixture panel (every value wired to its function, p.value,
+the window shared with the S&P 500).
 
 Why: these are the numbers the Diagnostics page shows and the backtest frontier reuses, so each
 is pinned to a hand-checkable literal. Synthetic inputs plus the committed fixture CSV.
@@ -126,6 +127,14 @@ def test_crash_returns_windows_inside_sample():
     assert metrics.crash_returns(nav.drop(pd.Timestamp("2018-12-24"))).loc["2018 Q4", "ret"] == pytest.approx(-0.15)
     sparse = pd.Series(1.0, pd.to_datetime(["2020-01-02", "2020-04-01"]))  # COVID lies inside but holds no row
     assert metrics.crash_returns(sparse).empty
+
+
+def test_crash_library_and_speed_tags():
+    # D14: Harvey et al.'s eight >15% S&P 500 drawdowns 1985-2018, COVID, the 2022 grind and the 2025 tariff shock
+    assert len(metrics.CRASHES) == 11 and metrics.CRASHES["2025 Tariff shock"] == ("2025-02-19", "2025-04-08")
+    assert metrics.CRASHES["2010 Flash crash"] == ("2010-04-23", "2010-07-02")
+    assert set(metrics.CRASH_SPEED) == set(metrics.CRASHES)
+    assert {k for k, v in metrics.CRASH_SPEED.items() if v == "slow"} == {"2000-02 Dot-com", "2007-09 GFC", "2022 Rates"}
 
 
 def test_concentration_excludes_cash():

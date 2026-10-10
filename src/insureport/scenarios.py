@@ -17,7 +17,7 @@ crash_frequency_sweep reassign the mass, so a zero-mass crash regime gets weight
 The bootstraps resample history and pair every w on the same paths: book_bootstrap draws whole
 years i.i.d. (the book's method), bootstrap draws Politis-Romano blocks of rebalance-period
 returns. Returns are decimal simple returns >= -1. Pure numpy/pandas/scipy; the only I/O is
-reading the packaged sp500_annual.csv.
+reading the packaged sp500_annual.csv (S&P 500 total return and CPI inflation by year).
 """
 
 from pathlib import Path
@@ -40,21 +40,29 @@ def _label(lo: float, hi: float) -> str:
 
 
 REGIME_LABELS = tuple(_label(a, b) for a, b in zip(REGIME_EDGES, REGIME_EDGES[1:]))  # "< -15%" ... "> 15%"
-# Safe Haven Part Three cartoons, per bin (crash bin first); the insurance crash payoff X
-# defaults to (1 - p)/p for a zero mean (book_haven)
+# Safe Haven Part Three cartoons, per bin (crash bin first); the insurance crash payoff X defaults to
+# (1 - p)/p for a zero mean, the store of value's "CPI" to CPI + REAL_RATE (book_haven). Addendum D5:
+# the Universa series' store of value earns CPI + 2% real (the default); the book's, 7% nominal
 BOOK_HAVENS = {
     "insurance": ("X", -1.0, -1.0, -1.0),
     "alpha": (0.20, 0.10, 0.05, 0.05),
-    "store_of_value": (0.02, 0.02, 0.02, 0.02),
+    "store_of_value": ("CPI", "CPI", "CPI", "CPI"),
+    "store_of_value_book": (0.07, 0.07, 0.07, 0.07),
 }
+REAL_RATE = 0.02
 SP500_CSV = Path(__file__).with_name("sp500_annual.csv")
 _CAGR_Q = {"cagr_p5": 5, "cagr_p25": 25, "cagr_p50": 50, "cagr_p75": 75, "cagr_p95": 95}
 
 
+def _annual_table() -> pd.DataFrame:
+    """The packaged CSV (total_return, cpi) indexed by year (int); `#` lines (the source note) skipped."""
+    return pd.read_csv(SP500_CSV, comment="#", index_col="year")
+
+
 def load_sp500_annual() -> pd.Series:
     """S&P 500 calendar-year total return (decimal) from the packaged CSV, indexed by year (int),
-    1928 to the last complete year. `#` lines (the source note) are skipped."""
-    return pd.read_csv(SP500_CSV, comment="#", index_col="year")["total_return"]
+    1928 to the last complete year."""
+    return _annual_table()["total_return"]
 
 
 def regime_of(ret: np.ndarray | float, edges: tuple[float, ...] = REGIME_EDGES) -> np.ndarray:
@@ -95,13 +103,21 @@ def book_haven(name: str, p_crash: float, insurance_payoff: float | None = None)
     The insurance crash payoff X is insurance_payoff, or (1 - p_crash) / p_crash: the payoff
     that makes p X - (1 - p) 100% = 0, i.e. a zero stand-alone mean (+900% at p = 0.1, Universa
     Part One; about +1000%, the "tenbagger", at p = 1/11, Part Three). Raises ValueError when the
-    default X needs p_crash outside (0, 1].
+    default X needs p_crash outside (0, 1]. "CPI" (store_of_value) is the mean of CPI_y + REAL_RATE
+    over the packaged table's years y (1928-2025) in the bin, binned by regime_of(total_return); NaN
+    for a bin with no year. That per-bin mean is a cartoon, not Part One's series: on 1997-2016 at a
+    10% weight it costs -9.4 bp of CAGR a year, where Part One's year-by-year CPI_y + 2% gives -18.4 bp
+    (it reports -17.9; test_part_one_cartoon_on_1997_2016).
     """
     table = BOOK_HAVENS[name]
     if "X" in table and insurance_payoff is None:
         if not 0 < p_crash <= 1:
             raise ValueError(f"p_crash must be in (0, 1] for the zero-mean insurance payoff, got {p_crash}")
         insurance_payoff = (1 - p_crash) / p_crash
+    if "CPI" in table:
+        a = _annual_table()[["total_return", "cpi"]].dropna()
+        sov = (a["cpi"] + REAL_RATE).groupby(regime_of(a["total_return"].to_numpy())).mean()
+        return sov.reindex(range(len(table))).to_numpy(float)
     return np.array([insurance_payoff if v == "X" else v for v in table], dtype=float)
 
 
@@ -111,24 +127,29 @@ def book_portfolio_returns(core_j: np.ndarray, haven_j: np.ndarray, w: np.ndarra
     return np.outer(core_j, 1 - w) + np.outer(haven_j, w)
 
 
+def full_year_returns(nav: pd.Series | pd.DataFrame) -> pd.Series | pd.DataFrame:
+    """metrics.annual_returns(nav) for full calendar years only: the first year is dropped (the NAV
+    starts inside it, so its return is measured from the first NAV), the last when the NAV ends before
+    that year's last business day (Mon-Fri, so a calendar month-end NAV ending on a weekend Dec 31
+    keeps it). Per column."""
+    a = metrics.annual_returns(nav)
+    first, last = nav.index[0], nav.index[-1]
+    return a[(a.index > first.year) & ((a.index < last.year) | ((last + pd.offsets.BDay()).year > last.year))]
+
+
 def regime_portfolio_returns(
     nav: pd.DataFrame, spx_annual: pd.Series, edges: tuple[float, ...] = REGIME_EDGES
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Estimated mode: (p, P, n) from the calendar-year returns of each NAV column.
 
-    The years are metrics.annual_returns(nav) restricted to full years that spx_annual has (non
-    NaN): the first year is dropped when the NAV starts inside it (its return would be measured
-    from the first NAV), the last when the NAV ends before that year's last business day (Mon-Fri,
-    so a calendar month-end NAV ending on a weekend Dec 31 keeps it). Each year goes to the
+    The years are full_year_returns(nav) that spx_annual has (non NaN). Each year goes to the
     regime of the S&P 500 return of the same year; n_j counts them, p_j = n_j / sum n,
     P (J x n_w) is the mean NAV-column return per regime, a NaN row where n_j = 0. Raises
     ValueError when no full year is left.
     """
-    a = metrics.annual_returns(nav)
-    first, last = nav.index[0], nav.index[-1]
-    full = (a.index > first.year) & ((a.index < last.year) | ((last + pd.offsets.BDay()).year > last.year))
+    a = full_year_returns(nav)
     spx = spx_annual.dropna()
-    a = a[full & a.index.isin(spx.index)]
+    a = a[a.index.isin(spx.index)]
     if a.empty:
         raise ValueError("no full calendar year of nav has an S&P 500 annual return")
     j = regime_of(spx.loc[a.index].to_numpy(), edges)

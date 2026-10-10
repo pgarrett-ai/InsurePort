@@ -1,13 +1,13 @@
-"""Tests for insureport.scenarios: the book's regime bins (right-closed edges) and the regime
-table, the cartoon haven tables (insurance X = (1 - p)/p), book-mode and estimated-mode
-portfolio returns per regime (full calendar years only, empty regimes NaN), geometric vs
-arithmetic dice growth (and ruin), the Kelly allocation (closed form, the w_max cap, the
-feasibility bound), cost-effectiveness, the breakeven crash frequency and the crash-frequency
-sweep (one and two crash regimes, a window with no crash year, invalid crash sets), the
-book-style annual bootstrap (joint / reshuffle / no-crash, annual vs no rebalancing, paired
-paths, seeds), the stationary block bootstrap (index paths, constant returns, the ergodicity
-panel, a dominant sleeve, drawdown depth per horizon and breaches, seeds, the 2,000 x 240 x 41
-speed budget) and the packaged S&P 500 annual series (source line, the Part One 1997-2016
+"""Tests for insureport.scenarios: the book's regime bins (right-closed edges) and the regime table,
+the cartoon haven tables (insurance X = (1 - p)/p, store of value CPI + 2% real or the book's 7%),
+book-mode and estimated-mode portfolio returns per regime (full calendar years only, empty regimes
+NaN), geometric vs arithmetic dice growth (and ruin), the Kelly allocation (closed form, the w_max
+cap, the feasibility bound), cost-effectiveness, the breakeven crash frequency and the
+crash-frequency sweep (one and two crash regimes, a window with no crash year, invalid crash sets),
+the book-style annual bootstrap (joint / reshuffle / no-crash, annual vs no rebalancing, paired
+paths, seeds), the stationary block bootstrap (index paths, constant returns, the ergodicity panel,
+a dominant sleeve, drawdown depth per horizon and breaches, seeds, the 2,000 x 240 x 41 speed
+budget) and the packaged S&P 500 annual series (source line, its CPI column, the Part One 1997-2016
 cartoon on it).
 
 Why: the Dice tab, the Kelly sizing and the bootstrap panels run through these functions, so
@@ -96,14 +96,27 @@ def test_part_three_cartoon_insurance():
     np.testing.assert_allclose(sc.book_haven("insurance", 0.1), [9.0, -1, -1, -1], rtol=0, atol=1e-12)
     assert sc.book_haven("insurance", 1 / 11, insurance_payoff=10.0)[0] == 10.0  # Part Three's "tenbagger"
     np.testing.assert_array_equal(sc.book_haven("alpha", 0.1), [0.20, 0.10, 0.05, 0.05])
-    np.testing.assert_array_equal(sc.book_haven("store_of_value", 0.1), [0.02] * 4)
+    np.testing.assert_array_equal(sc.book_haven("store_of_value_book", 0.1), [0.07] * 4)  # the book's 7% nominal
     with pytest.raises(ValueError, match="p_crash"):
         sc.book_haven("insurance", 0.0)
 
 
+def test_store_of_value_is_cpi_plus_two_percent_real(monkeypatch):
+    # addendum D5 (Universa Part One): CPI_y + 2% real, averaged per regime over the packaged table's years
+    s, cpi = sc.load_sp500_annual(), sc._annual_table()["cpi"]
+    assert cpi.index.equals(s.index) and cpi[2022] == pytest.approx(0.0645, abs=5e-4)  # Dec/Dec CPI-U
+    crash = cpi[s <= -0.15]  # 1930, 1931, 1937, 1974, 2002, 2008, 2022
+    assert sc.book_haven("store_of_value", 0.1)[0] == pytest.approx(crash.mean() + 0.02, abs=1e-12)
+    # _annual_table is the seam: hand-made years, one or two per bin
+    annual = pd.DataFrame({"total_return": [-0.30, -0.05, 0.10, 0.20, 0.25], "cpi": [0.01, 0.02, 0.03, 0.04, 0.06]},
+                          index=range(2000, 2005))
+    monkeypatch.setattr(sc, "_annual_table", lambda: annual)
+    np.testing.assert_allclose(sc.book_haven("store_of_value", 0.1), [0.03, 0.04, 0.05, 0.07], atol=1e-15)
+
+
 def test_store_of_value_is_not_cost_effective():
-    # BOOK_HAVENS store_of_value (flat +2%) on the Part Three cartoon; Part One's -17.9 bp used
-    # CPI + 2% real at a 10% weight on 1997-2016
+    # a flat +2% store of value on the Part Three cartoon; Part One's -17.9 bp used CPI + 2% real at a
+    # 10% weight on 1997-2016
     sov = np.full(2, 0.02)
     assert sc.cost_effective(P2, CORE2, sov) is False
     assert sc.kelly_w(P2, CORE2, sov) == 0.0
@@ -418,3 +431,8 @@ def test_part_one_cartoon_on_1997_2016():
 
     assert gain("alpha", 0.10) == pytest.approx(0.0018, abs=0.0002)
     assert gain("insurance", 0.03) == pytest.approx(0.0067, abs=0.0002)
+    # and 90% SPX + 10% store of value earning each year's CPI + 2% real trails SPX by about -17.9 bp (-18.4 here);
+    # book_haven's per-bin 1928-2025 mean gives about half that (-9.4 bp, its docstring)
+    cpi = sc._annual_table()["cpi"].loc[1997:2016].to_numpy()
+    sov = np.prod(0.9 * (1 + r) + 0.1 * (1 + cpi + 0.02)) ** (1 / 20) - np.prod(1 + r) ** (1 / 20)
+    assert sov == pytest.approx(-0.0018, abs=0.0002) and gain("store_of_value", 0.10) == pytest.approx(-0.00094, abs=5e-5)

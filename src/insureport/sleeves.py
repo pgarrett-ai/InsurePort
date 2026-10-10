@@ -64,12 +64,16 @@ class Leg:
 class OptionSpec:
     """A rolled option strategy.
 
-    mode "premium": each roll spends premium_frac of the sleeve's cash on the package; "overlay":
-    the sleeve holds the underlying and options on coverage x its value. monetize_mult: close and
-    re-strike every leg once the long legs are worth monetize_mult x what they cost.
-    roll_every_months: roll on every N-th monthly roll date (third Fridays). settle: the S&P 500 level
-    an expiring leg pays intrinsic against, on its expiry trading day: "close" (PM settlement), or
-    "open" (spx_open, the proxy for Cboe's AM Special Opening Quotation).
+    mode "premium": each roll spends premium_frac of a budget base on the package: budget_base
+    "cash", the sleeve's cash; "anchor" (addendum D3), the sleeve NAV at the last anchor date
+    (option_sleeve's anchors), capped at the cash; "overlay": the sleeve holds the underlying and options
+    on coverage x its value. monetize_mult: close and re-strike every leg once the long legs are worth
+    monetize_mult x what they cost. roll_every_months: roll on every N-th monthly roll date, those of
+    roll_dates(when=roll_when): "third_friday" (Cboe's calendar) or "month_start" (the first trading day
+    of the month, Universa's Rule B; expiries stay third Fridays). settle: the S&P 500 level an expiring
+    leg pays intrinsic against, on its expiry trading day: "close" (PM settlement), or "open" (spx_open,
+    the proxy for Cboe's AM Special Opening Quotation). harvest_at_anchor: sell every held leg into cash
+    at the close of each anchor row (the portfolio rebalance), so the anchor budget base is all T-bills.
     """
 
     legs: tuple[Leg, ...]
@@ -79,6 +83,9 @@ class OptionSpec:
     monetize_mult: float | None = None
     roll_every_months: int = 1
     settle: str = "close"
+    budget_base: str = "cash"
+    roll_when: str = "third_friday"
+    harvest_at_anchor: bool = False
 
 
 def third_friday(year: int, month: int) -> pd.Timestamp:
@@ -87,22 +94,32 @@ def third_friday(year: int, month: int) -> pd.Timestamp:
     return first + pd.Timedelta(days=(4 - first.weekday()) % 7 + 14)
 
 
-def roll_dates(index: pd.DatetimeIndex, every_months: int = 1, offset_bdays: int = 0) -> pd.DatetimeIndex:
+def roll_dates(
+    index: pd.DatetimeIndex, every_months: int = 1, offset_bdays: int = 0, when: str = "third_friday"
+) -> pd.DatetimeIndex:
     """Monthly roll dates inside a sorted trading-day index.
 
-    Each month's third Friday snaps to the last index date on or before it (Good Friday
-    2019-04-19 -> 2019-04-18). A month gets no roll when that date is not in the same month (no
+    when "third_friday": each month's third Friday snaps to the last index date on or before it (Good
+    Friday 2019-04-19 -> 2019-04-18). A month gets no roll when that date is not in the same month (no
     index dates up to its Friday) or when the index ends before the Friday (the roll has not
-    happened yet). Then every every_months-th roll is kept (0, N, 2N, ...) and each is moved
-    offset_bdays index positions later (the roll-offset sweep); rolls pushed past the end drop out.
+    happened yet). when "month_start": the first index date of each month (the index's own first date
+    counts, so a panel starting mid-month rolls on its first day). Then every every_months-th roll is
+    kept (0, N, 2N, ...) and each is moved offset_bdays index positions later (the roll-offset sweep);
+    rolls pushed past the end drop out. Raises ValueError for any other `when`.
     """
     idx = pd.DatetimeIndex(index)
+    if when not in ("third_friday", "month_start"):
+        raise ValueError(f"when must be 'third_friday' or 'month_start', got {when!r}")
     if idx.empty:
         return idx
-    fri = pd.date_range(idx[0].to_period("M").start_time, idx[-1], freq="WOM-3FRI")
-    pos = idx.searchsorted(fri, side="right") - 1
     ym = idx.year * 12 + idx.month
-    pos = pos[(pos >= 0) & (ym[np.maximum(pos, 0)] == fri.year * 12 + fri.month)][::every_months] + offset_bdays
+    if when == "month_start":
+        pos = np.flatnonzero(np.r_[True, np.diff(ym) != 0])
+    else:
+        fri = pd.date_range(idx[0].to_period("M").start_time, idx[-1], freq="WOM-3FRI")
+        pos = idx.searchsorted(fri, side="right") - 1
+        pos = pos[(pos >= 0) & (ym[np.maximum(pos, 0)] == fri.year * 12 + fri.month)]
+    pos = pos[::every_months] + offset_bdays
     return idx[pos[(pos >= 0) & (pos < len(idx))]]
 
 
@@ -120,6 +137,8 @@ def _check(spec: OptionSpec) -> None:
         raise ValueError("need at least one leg and roll_every_months >= 1")
     if spec.settle not in ("close", "open"):
         raise ValueError(f"settle must be 'close' or 'open', got {spec.settle!r}")
+    if spec.budget_base not in ("cash", "anchor"):  # roll_dates checks roll_when
+        raise ValueError(f"budget_base must be 'cash' or 'anchor', got {spec.budget_base!r}")
     for L in spec.legs:
         if L.cp not in ("P", "C") or (L.otm is None) == (L.delta is None):
             raise ValueError(f"{L}: cp must be 'P' or 'C' and exactly one of otm / delta set")
@@ -314,11 +333,13 @@ def option_sleeve(
     offset_bdays: int = 0,
     z_cap: float = pricing.Z_CAP,
     chain: pd.DataFrame | None = None,
+    anchors: pd.DatetimeIndex | None = None,
+    carry: pd.Series | None = None,
 ) -> pd.DataFrame:
     """Daily returns of a rolled synthetic-SPX-option sleeve, per unit of sleeve capital.
 
-    Calendar: rolls = roll_dates(mkt.index, spec.roll_every_months, offset_bdays), dropping any
-    before the first row with usable pricing inputs; leg i opens at rolls whose ordinal is a
+    Calendar: rolls = roll_dates(mkt.index, spec.roll_every_months, offset_bdays, spec.roll_when),
+    dropping any before the first row with usable pricing inputs; leg i opens at rolls whose ordinal is a
     multiple of its every_months, expires on the third Friday of (open month + tenor_months) and
     closes ceil(hold_months / roll_every_months) rolls later (_check rejects a close after expiry).
     DEVIATION from the brief ("the event in month M + hold_months"): the same roll whenever every
@@ -331,7 +352,8 @@ def option_sleeve(
     it at the bid / ask |offset_bdays| rows before it expires.
     Before the first roll the sleeve is all cash (premium) or all underlying (overlay).
 
-    State: cash C (grows by 1 + rf_{t-1} days/360), stock A (overlay; grows with `underlying`,
+    State: cash C (grows by 1 + rf_{t-1} days/360, or by 1 + `carry`, daily returns on mkt's dates (NaN
+    0), when given: the TAIL proxy's cash is a Treasury), stock A (overlay; grows with `underlying`,
     default spxtr.pct_change()), legs n_j (signed index units). NAV = A + C + sum n_j mid_j.
     Quotes from pricing.quote via _quotes (m, nu, h, z_cap passed on; m, nu, z_cap also to
     strike_for_delta): marks at mid; opens at the ask (long) / bid (short); closes before expiry
@@ -348,7 +370,10 @@ def option_sleeve(
     are scale-free), so the test is relative and a sleeve that bleeds for decades cannot
     underflow; attrs n stays on the scale of the NAV compounded from ret (reset to 1 by a restart);
     (4) open the package (the scheduled legs plus any monetized ones), u = sum qty_j fill_j:
-      premium: B = premium_frac C (u > 0 required), N = B / u, C -= B (no cash left: B = N = 0,
+      premium: B = premium_frac C (budget_base "cash"), or min(premium_frac base, C) ("anchor"; base =
+      the NAV at the close of the last anchor row: the first row on or after each `anchors` date; the
+      start, NAV 1, before the first; anchors None = every event, so base = NAV_pre; a restart from unit
+      capital re-anchors), u > 0 required, N = B / u, C -= B (no cash left: B = N = 0,
       and the zero-size legs are left out of attrs);
       overlay: A += C, C = 0, A <- A / (1 + coverage u / S), N = coverage A / S, B = N u;
     n_j = qty_j N, premium_paid_t = B / NAV_pre, coverage_t = S sum_{held, n_j > 0} n_j / NAV_pre
@@ -362,6 +387,11 @@ def option_sleeve(
     every held leg is checked, on a roll the legs held over it. DEVIATION from the brief: a
     net-credit package (cost <= 0, e.g. a collar) is checked against its long legs' cost, since
     the brief's rule would fire at once.
+    Harvest (spec.harvest_at_anchor): every anchor row is an event that closes all held legs (bid /
+    ask, close_reason "harvest") and opens none (a roll on the same row opens its legs after), so the
+    budget base is cash: the year-end rebalance sweeps a payoff into T-bills instead of carrying put
+    marks that decay before they are sold (with them the cash cap ran the sleeve dry after a year-end
+    spike, the fixture's 2018 Q4).
 
     Between events holdings are fixed and marked in one vectorized step. A row with unusable
     inputs (_inputs) prices every leg at the row's own S and date with the last usable vols, SKEW,
@@ -384,12 +414,13 @@ def option_sleeve(
     before the listed expiration (a pre-2015 Saturday expiration settles on the Friday, a holiday
     Friday's Thursday listing on the Thursday).
 
-    Returns a DataFrame on mkt.index: ret, event (bool, rolls and monetizations), premium_paid
-    (B / NAV_pre on events, else 0), coverage (long option notional held / NAV_post as of the
-    latest event, 0 before the first), fallback_quotes (int). attrs["legs"]: one dict per leg
+    Returns a DataFrame on mkt.index: ret, event (bool, rolls, monetizations and harvests), premium_paid
+    (B / NAV_pre on events, else 0), coverage (long option notional held / NAV at each close: S_t
+    sum_{held, n_j > 0} n_j / NAV_t, NAV_post on events, 0 while no long leg is held or NAV <= 0),
+    fallback_quotes (int). attrs["legs"]: one dict per leg
     opened (size n != 0), by open date: open_date, close_date (scheduled; None past the data),
     expiry, cp, K, n, unit_cost, closed_on (None if still open), close_reason ("roll" | "expiry" |
-    "monetize" | None), settle_px (the level it settled at; None unless it reached its expiry in
+    "monetize" | "harvest" | None), settle_px (the level it settled at; None unless it reached its expiry in
     the data), source ("chain": a listed contract, "model": none found or no chain). pandas
     deep-copies attrs into every derived object (~50 ms per op on a 9,000-day sleeve), so strip it
     before heavy arithmetic: r = df["ret"].copy(); r.attrs = {}.
@@ -403,7 +434,7 @@ def option_sleeve(
         mkt = pricing.fill_term_structure(mkt)
     px, n, kw = _inputs(mkt, spec.settle), len(mkt), {"m": m, "nu": nu, "h": h, "z_cap": z_cap, "chain": chain}
     premium = spec.mode == "premium"
-    ev = mkt.index.get_indexer(roll_dates(mkt.index, spec.roll_every_months, offset_bdays))
+    ev = mkt.index.get_indexer(roll_dates(mkt.index, spec.roll_every_months, offset_bdays, spec.roll_when))
     ev = ev[px["eff"][ev] >= 0].tolist()
     steps = [math.ceil((L.hold_months or L.tenor_months) / spec.roll_every_months) for L in spec.legs]
     plan = [(t, L, ev[k + s] if k + s < len(ev) else n)
@@ -415,16 +446,22 @@ def option_sleeve(
 
     r_und = mkt["spxtr"].ffill().pct_change() if underlying is None else underlying.reindex(mkt.index)
     g_und = 1 + r_und.fillna(0.0).to_numpy(float)
-    g_cash = 1 + cash_returns(mkt["rf"].ffill().fillna(0.0)).to_numpy(float)
+    r_cash = cash_returns(mkt["rf"].ffill().fillna(0.0)) if carry is None else carry.reindex(mkt.index).fillna(0.0)
+    g_cash = 1 + r_cash.to_numpy(float)
     g_und[0] = g_cash[0] = 1.0  # row 0 is the start: NAV 1
     ret, paid, fb = np.zeros(n), np.zeros(n), np.zeros(n, dtype=int)
-    event, cover = np.zeros(n, dtype=bool), np.full(n, np.nan)
+    event, cover = np.zeros(n, dtype=bool), np.zeros(n)
     A, C = (0.0, 1.0) if premium else (1.0, 0.0)
     held: list[dict] = []
     pos, nav, lvl = -1, 1.0, 1.0  # holdings as of the close of row pos; nav = NAV the next return is measured from
+    anchor = np.zeros(n, dtype=bool)  # budget_base "anchor": rows whose closing NAV becomes the budget base
+    if anchors is not None:
+        at = mkt.index.searchsorted(pd.DatetimeIndex(anchors))
+        anchor[at[at < n]] = True
+    budget = 1.0  # the anchor budget base, in the state's units (rescaled with it at every event)
     for stop in [*ev, n]:
         while True:
-            # mark rows pos+1 .. stop-1 with fixed holdings, cut at a monetize trigger
+            # mark rows pos+1 .. stop-1 with fixed holdings, cut at a monetize trigger or a harvest
             days = np.arange(pos + 1, stop)
             val = (np.column_stack([g["n"] * g["mid"][days - g["open"]] for g in held]) if held
                    else np.zeros((len(days), 0)))
@@ -433,7 +470,15 @@ def option_sleeve(
             if spec.monetize_mult is not None:
                 hits = np.flatnonzero(_cashed_in(held, val, spec.monetize_mult))
                 cut = hits[0] if len(hits) else cut
+            if spec.harvest_at_anchor and held:
+                hits = np.flatnonzero(anchor[days[:cut]])
+                cut = hits[0] if len(hits) else cut
             days, navs = days[:cut], navs[:cut]
+            long_n = sum(g["n"] for g in held if g["n"] > 0)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                cover[days] = np.where(navs > 0, px["spx"][days] * long_n / navs, 0.0)
+            hit = np.flatnonzero(anchor[days])
+            budget = navs[hit[-1]] if len(hit) else budget
             # ponytail: ret is a double. Under a flat or near-flat put wing a far-OTM put held to expiry at f ~ 1
             # marks below 1e-16 of the day before in the last ~4 trading days at VIX <= 15, ret rounds to -1, and a
             # gain or crash payoff in expiry week is lost to compounding (test_expiry_week_payoff_is_lost_to_return_
@@ -444,14 +489,15 @@ def option_sleeve(
                 base = np.r_[nav, navs[:-1]]
                 ret[days] = np.where(base > 0, navs / base - 1, 0.0)  # no capital, no return
             nav = navs[-1] if cut else nav
-            t = pos + 1 + cut  # the event row: a monetize trigger, the roll at `stop`, or past the end
+            t = pos + 1 + cut  # the event row: a monetize trigger, a harvest, the roll at `stop`, or past the end
             if t >= n:
                 break
             A *= np.prod(g_und[pos + 1 : t + 1])
             C *= np.prod(g_cash[pos + 1 : t + 1])
             rest = [g for g in held if g["close"] > t]  # between rolls every held leg; on a roll, those held over it
-            monetize = t < stop
-            if not monetize and rest and spec.monetize_mult is not None:
+            harvest = spec.harvest_at_anchor and bool(anchor[t])
+            monetize = t < stop and not harvest
+            if not (monetize or harvest) and rest and spec.monetize_mult is not None:
                 mark = np.array([[g["n"] * g["mid"][t - g["open"]] for g in rest]])
                 monetize = bool(_cashed_in(rest, mark, spec.monetize_mult)[0])
             # ponytail: monetize-day rebalance flows are charged the normal bid haircut only on the option legs
@@ -459,21 +505,25 @@ def option_sleeve(
             # missing from the data, or under a chain with offset_bdays > 0 (the listed monthly expires before the
             # shifted roll). Sweep it to cash on the settle row if gappy panels or offset chain sweeps matter.
             for g in held:
-                if g["close"] <= t or monetize:
+                if g["close"] <= t or monetize or harvest:
                     i, expired = t - g["open"], t >= g["settle"]
                     C += g["n"] * (g["mid"] if expired else g["bid"] if g["leg"].qty > 0 else g["ask"])[i]
                     g["closed_on"] = t
-                    g["reason"] = "monetize" if g["close"] > t else "expiry" if expired else "roll"
+                    early = "harvest" if harvest else "monetize"
+                    g["reason"] = early if g["close"] > t else "expiry" if expired else "roll"
             held = [g for g in held if g["closed_on"] is None]
             marks = sum(g["n"] * g["mid"][t - g["open"]] for g in held)
             nav_pre = A + C + marks
             ret[t], event[t] = (nav_pre / nav - 1 if nav > 0 else 0.0), True
-            if nav_pre <= WIPED_OUT:  # DEVIATION from the brief (pure premium only): overlay too, if its stock hits 0
+            wiped = nav_pre <= WIPED_OUT
+            if wiped:  # DEVIATION from the brief (pure premium only): overlay too, if its stock hits 0
                 ret[t], A, C, lvl = -1.0, 0.0, 1.0, 1.0
                 nav_pre = C + marks
+            if wiped or anchors is None or anchor[t]:
+                budget = nav_pre
             # rescale to NAV_pre = 1: the state is in units of the last event's NAV_post, so WIPED_OUT above is
             # relative to it; lvl = reported NAV per unit (attrs n)
-            A, C, lvl = A / nav_pre, C / nav_pre, lvl * nav_pre
+            A, C, lvl, budget = A / nav_pre, C / nav_pre, lvl * nav_pre, budget / nav_pre
             for g in held:
                 g["n"] /= nav_pre
             reopen = _open_legs(px, [(t, g["leg"], g["close"]) for g in rest], offset_bdays, **kw) if monetize else []
@@ -486,6 +536,8 @@ def option_sleeve(
                     if not u > 0:
                         raise ValueError(f"premium package costs {u:.4f} <= 0 on {mkt.index[t]:%Y-%m-%d}")
                     B = spec.premium_frac * C
+                    if spec.budget_base == "anchor":
+                        B = max(min(spec.premium_frac * budget, C), 0.0)
                     N, C = B / u, C - B
                 else:
                     A, C = (A + C) / (1 + spec.coverage * u / S), 0.0
@@ -506,8 +558,7 @@ def option_sleeve(
         e = min(n if g["closed_on"] is None else g["closed_on"] + 1, g["settle"])
         fb[g["open"] : e] += g["fb"][: e - g["open"]]
     out = pd.DataFrame(
-        {"ret": ret, "event": event, "premium_paid": paid, "coverage": pd.Series(cover).ffill().fillna(0.0).to_numpy(),
-         "fallback_quotes": fb},
+        {"ret": ret, "event": event, "premium_paid": paid, "coverage": cover, "fallback_quotes": fb},
         index=mkt.index,
     )
     date = mkt.index

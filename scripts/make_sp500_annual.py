@@ -1,5 +1,5 @@
-"""Rebuild src/insureport/sp500_annual.csv: S&P 500 calendar-year total returns, 1928 to the last
-complete year (network required).
+"""Rebuild src/insureport/sp500_annual.csv: S&P 500 calendar-year total returns and US CPI inflation,
+1928 to the last complete year (network required).
 
 Usage, from the repo root: .venv/Scripts/python scripts/make_sp500_annual.py
 Primary source: Damodaran, "Historical Returns on Stocks, Bonds and Bills" (histretSP), the
@@ -9,6 +9,9 @@ values carry 4 decimals. Fallback: Shiller's monthly price and dividend series (
 read from the datasets/s-and-p-500 CSV mirror for the same reason. The CSV's first line names the
 source used; nothing is written unless the 2008 / 2013 / 1931 spot checks pass. The test suite's
 golden fixtures are Damodaran's numbers, so a fallback build is written with a warning.
+CPI (the `cpi` column, the store-of-value cartoon's CPI + 2% real, addendum D5): calendar-year inflation
+CPI-U December / previous December - 1 from FRED CPIAUCNS (BLS, not seasonally adjusted, 1913 on);
+Damodaran's HTML table carries no inflation column. Spot-checked like the returns (1932, 1980, 2022).
 """
 
 import datetime as dt
@@ -18,12 +21,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from insureport.data import _http_text
+from insureport.data import FRED_URL, _http_text, parse_fred_csv
 
 OUT = Path(__file__).resolve().parents[1] / "src" / "insureport" / "sp500_annual.csv"
 DAMODARAN = "https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/histretSP.html"
 SHILLER = "https://raw.githubusercontent.com/datasets/s-and-p-500/main/data/data.csv"
 CHECKS = {2008: -0.37, 2013: 0.32, 1931: -0.44}  # +-0.03: catches parse errors, passes the Shiller approximation
+CPI_CHECKS = {1932: -0.103, 1980: 0.125, 2022: 0.065}  # Dec/Dec CPI-U, +-0.005
 
 
 def damodaran() -> pd.Series:
@@ -46,6 +50,13 @@ def shiller() -> pd.Series:
     by_year = (1 + r).groupby(r.index.year)
     out = by_year.prod().where(by_year.count() == 12) - 1
     return out.loc[1928:].dropna()
+
+
+def cpi() -> pd.Series:
+    """Year -> CPI-U inflation, December over the previous December (FRED CPIAUCNS, monthly index)."""
+    m = parse_fred_csv(_http_text(FRED_URL.format(sid="CPIAUCNS")), "CPIAUCNS")
+    dec = m[m.index.month == 12].pct_change().dropna()
+    return dec.set_axis(dec.index.year)
 
 
 def check(s: pd.Series) -> None:
@@ -71,11 +82,16 @@ for name, url, fetch in SOURCES:
 else:
     raise SystemExit("no source passed the checks; sp500_annual.csv not written")
 
-s = s.round(6).rename("total_return").rename_axis("year")
-header = f"# source: {name}, S&P 500 total return incl. dividends, {url} (fetched {dt.date.today():%Y-%m-%d})\n"
-OUT.write_text(header + s.to_csv(lineterminator="\n"), encoding="utf-8", newline="\n")
-print(f"{OUT.name}: {len(s)} years {s.index[0]}-{s.index[-1]} from {name}")
-print("checks:", {y: float(s[y]) for y in CHECKS})
+infl = cpi().reindex(s.index)
+bad = {y: round(infl.get(y, np.nan), 4) for y, v in CPI_CHECKS.items() if not abs(infl.get(y, np.nan) - v) <= 0.005}
+if infl.isna().any() or bad:
+    raise SystemExit(f"CPI missing for {infl.index[infl.isna()].tolist()} or off its spot checks {bad}; not written")
+out = pd.DataFrame({"total_return": s.round(6), "cpi": infl.round(6)}).rename_axis("year")
+header = (f"# source: {name}, S&P 500 total return incl. dividends, {url}; cpi: CPI-U Dec/Dec inflation, FRED "
+          f"CPIAUCNS, {FRED_URL.format(sid='CPIAUCNS')} (fetched {dt.date.today():%Y-%m-%d})\n")
+OUT.write_text(header + out.to_csv(lineterminator="\n"), encoding="utf-8", newline="\n")
+print(f"{OUT.name}: {len(s)} years {s.index[0]}-{s.index[-1]} from {name}, CPI from FRED CPIAUCNS")
+print("checks:", {y: float(s[y]) for y in CHECKS}, "cpi:", {y: float(infl[y]) for y in CPI_CHECKS})
 if s.index[-1] < dt.date.today().year - 1:
     print(f"WARNING: source ends {s.index[-1]}, last complete year is {dt.date.today().year - 1}")
 if fetch is not damodaran:

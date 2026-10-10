@@ -1,24 +1,26 @@
 """Tests for insureport.sleeves: third Fridays and the roll calendar (Good Friday snap, offsets,
-quarterly rolls, months without data, data ending before the roll), the option sleeve in premium
-mode (full budget wiped out and refilled each roll, the output columns, the spread cost on the day
-after the open, coverage, half budget halving the NAV over 50 rolls with no spurious wipe-out, a
-crash paying intrinsic at expiry, a Good Friday expiry settling on Thursday, settlement at the open
-(Cboe's SOQ proxy) and its settle_px ledger entry, listed-strike snapping (floor strictly below,
-ceil at or above, continuous; grid ties up to float noise) and the open as the strike reference (a
-missing or all-NaN open column refused), monetization closing
-at the bid and re-striking (also under offset rolls), against the net debit of a spread, the long
-legs' cost of a net-credit collar and on a roll day), overlay mode (the put financed by selling
-stock at coverage 1 and 0.5, premium paid, a custom underlying, a wiped-out stock restarting),
-short legs (opened at the bid, bought back at the ask, the negative cash swept into stock), a
-CLL-like collar (quarterly put, monthly short call), a three-tranche ladder spending a fraction of
-its cash, coverage counting every long leg held and 0 while none is, the offset and roll-frequency
-pass-through (expiries move with offset rolls), rolls before the first usable pricing row skipped,
-a NaN input day on a quiet day and on a crash expiry (model inputs carried, spot not) and a
+quarterly rolls, months without data, data ending before the roll; month-start rolls keeping
+third-Friday expiries), the option sleeve in premium mode (the anchored budget: a share of the NAV
+at the last anchor, capped at the cash; the anchor-row harvest selling every leg into cash; a carry
+series replacing the T-bill accrual; full budget wiped out and refilled each roll, the output
+columns, the spread cost on the day after the open, coverage, half budget halving the NAV over 50
+rolls with no spurious wipe-out, a crash paying intrinsic at expiry, a Good Friday expiry settling
+on Thursday, settlement at the open (Cboe's SOQ proxy) and its settle_px ledger entry, listed-strike
+snapping (floor strictly below, ceil at or above, continuous; grid ties up to float noise) and the
+open as the strike reference (a missing or all-NaN open column refused), monetization closing at the
+bid and re-striking (also under offset rolls), against the net debit of a spread, the long legs'
+cost of a net-credit collar and on a roll day), overlay mode (the put financed by selling stock at
+coverage 1 and 0.5, premium paid, a custom underlying, a wiped-out stock restarting), short legs
+(opened at the bid, bought back at the ask, the negative cash swept into stock), a CLL-like collar
+(quarterly put, monthly short call), a three-tranche ladder spending a fraction of its cash,
+coverage counting every long leg held, 0 while none is and marked daily between events, the offset and roll-frequency
+pass-through (expiries move with offset rolls), rolls before the first usable pricing row skipped, a
+NaN input day on a quiet day and on a crash expiry (model inputs carried, spot not) and a
 partial-pillar day (not a fallback), the expiry-week return-rounding limit, cash accrual and the
 rates, dividends, VIX pillars (VIX1Y on a 13-month put) and smile knobs reaching the pricer, the
 term-structure back-fill, a delta-targeted strike, z_cap reaching the quotes and the delta strike,
-spec validation, the T-bill sleeve, the par-bond proxy, long/flat time-series momentum and the
-build time of a Universa-like sleeve on a 9,000-day panel.
+spec validation, the T-bill sleeve, the par-bond proxy, long/flat time-series momentum and the build
+time of a Universa-like sleeve on a 9,000-day panel.
 
 Why: every option-based safe haven in the backtests is one of these return series, so the
 accounting (what is paid, when, at which quote) is pinned to values recomputed here from
@@ -26,6 +28,7 @@ pricing.quote on small synthetic panels. Pure functions on synthetic inputs, no 
 """
 
 import time
+from dataclasses import replace
 
 import numpy as np
 import pandas as pd
@@ -80,6 +83,74 @@ def test_third_friday_and_roll_dates():
     # third Friday: no June roll yet
     gap = idx[(idx.month != 4) & (idx < "2019-06-20")]
     assert sleeves.roll_dates(gap).tolist() == [ev[0], ev[2]]
+
+
+def test_month_start_rolls():
+    # addendum section 11 (Rule B): the first trading day of each month; New Year's Day 2019 is a holiday
+    idx = pd.bdate_range("2019-01-01", "2019-06-28").drop(pd.Timestamp("2019-01-01"))
+    ev = sleeves.roll_dates(idx, when="month_start")
+    assert ev.tolist() == pd.to_datetime(["2019-01-02", "2019-02-01", "2019-03-01", "2019-04-01", "2019-05-01",
+                                          "2019-06-03"]).tolist()
+    assert sleeves.roll_dates(idx, every_months=2, offset_bdays=1, when="month_start").tolist() == pd.to_datetime(
+        ["2019-01-03", "2019-03-04", "2019-05-02"]).tolist()
+    with pytest.raises(ValueError, match="when"):
+        sleeves.roll_dates(idx, when="month_end")
+    # a sleeve rolling on month starts keeps third-Friday expiries: a 2-month put bought 02-01 expires 04-19
+    spec = OptionSpec((Leg("P", otm=0.30, tenor_months=2, hold_months=2),), premium_frac=0.5, roll_when="month_start")
+    df = sleeves.option_sleeve(_panel(periods=120), spec)
+    assert df.index[df["event"]].equals(sleeves.roll_dates(_panel(periods=120).index, when="month_start"))
+    g = df.attrs["legs"][1]
+    assert (g["open_date"], g["expiry"]) == (pd.Timestamp("2019-02-01"), pd.Timestamp("2019-04-19"))
+    assert (g["closed_on"], g["close_reason"]) == (pd.Timestamp("2019-04-01"), "roll")  # 18 days left: sold at the bid
+
+
+def test_anchor_budget_spends_a_share_of_the_nav_at_the_last_anchor():
+    # D3: f x NAV at the last anchor, capped at the cash left; the cash budget spends f x the cash instead
+    mkt = _panel(periods=200)
+    leg = Leg("P", otm=0.25, tenor_months=3)  # a three-tranche ladder held to expiry
+    ev = sleeves.roll_dates(mkt.index)
+    anchor = pd.DatetimeIndex(["2019-01-01", "2019-04-30"])  # the start, then mid-segment
+    df = sleeves.option_sleeve(mkt, OptionSpec((leg,), premium_frac=0.2, budget_base="anchor"), anchors=anchor)
+    nav = _nav(df)
+    spent = (df["premium_paid"] * nav)[ev]  # B in units of the starting NAV
+    base = np.where(ev < anchor[1], 1.0, nav[anchor[1]])
+    np.testing.assert_allclose(spent[:6], 0.2 * base[:6], rtol=1e-12)  # from the 7th roll the cash cap binds
+    # the cap: 0.45 of the start NAV a roll leaves 0.10 for the third roll and nothing after (rf = 0, the first
+    # tranche expires worthless on the fourth)
+    capped = sleeves.option_sleeve(mkt, OptionSpec((leg,), premium_frac=0.45, budget_base="anchor"),
+                                   anchors=anchor[:1])
+    np.testing.assert_allclose((capped["premium_paid"] * _nav(capped))[ev[:4]], [0.45, 0.45, 0.10, 0.0], atol=1e-12)
+    # anchors=None: every event is an anchor, so B = f x NAV_pre (marks of the tranches held included)
+    every = sleeves.option_sleeve(mkt, OptionSpec((leg,), premium_frac=0.2, budget_base="anchor"))
+    np.testing.assert_allclose(every.loc[ev, "premium_paid"], 0.2, rtol=1e-12)
+    cash = sleeves.option_sleeve(mkt, OptionSpec((leg,), premium_frac=0.2))
+    assert cash.at[ev[1], "premium_paid"] < 0.2  # f x cash < f x NAV once a tranche is held
+    with pytest.raises(ValueError, match="budget_base"):
+        sleeves.option_sleeve(mkt, OptionSpec((leg,), budget_base="nav"))
+
+
+def test_harvest_sells_every_leg_into_cash_at_an_anchor():
+    # Universa's year-end rebalance: the anchor row sells the ladder at the bid, so the next budget is all cash
+    mkt, t = _panel(periods=120), pd.Timestamp("2019-03-29")
+    spec = OptionSpec((Leg("P", otm=0.25, tenor_months=3),), premium_frac=0.2, budget_base="anchor",
+                      harvest_at_anchor=True)
+    df = sleeves.option_sleeve(mkt, spec, anchors=pd.DatetimeIndex([t]))
+    nav, ev = _nav(df), sleeves.roll_dates(mkt.index)
+    sold = [g for g in df.attrs["legs"] if g["closed_on"] == t]
+    assert len(sold) == 3 and {g["close_reason"] for g in sold} == {"harvest"}  # the 01-18, 02-15, 03-15 tranches
+    assert df.at[t, "event"] and df.at[t, "coverage"] == 0
+    cash = 1 - (df["premium_paid"] * nav)[ev[ev < t]].sum()  # rf = 0
+    assert nav[t] == pytest.approx(cash + sum(g["n"] * _quote(g, t)[1] for g in sold), rel=1e-12)
+    assert (df["premium_paid"] * nav)["2019-04-19"] == pytest.approx(0.2 * nav[t], rel=1e-12)  # 0.2 x the cash
+    held = sleeves.option_sleeve(mkt, replace(spec, harvest_at_anchor=False), anchors=pd.DatetimeIndex([t]))
+    assert not held.at[t, "event"] and all(g["closed_on"] != t for g in held.attrs["legs"])  # no harvest: kept
+
+
+def test_carry_replaces_the_t_bill_accrual():
+    # the TAIL proxy's cash is a Treasury: before the first roll (01-18) the sleeve grows with carry, not rf
+    mkt = _panel(periods=30, rf=0.05)
+    df = sleeves.option_sleeve(mkt, OptionSpec((PUT25,), premium_frac=0.01), carry=pd.Series(0.001, mkt.index))
+    np.testing.assert_allclose(df["ret"][:"2019-01-17"].iloc[1:], 0.001, rtol=1e-12)
 
 
 def test_premium_full_budget_is_wiped_out_and_refilled_each_roll():
@@ -367,6 +438,18 @@ def test_coverage_is_zero_while_no_legs_are_open():
         assert df.at[g["open_date"], "coverage"] == pytest.approx(S0 / _quote(g, g["open_date"])[2], rel=1e-12)
     for a, b in zip(ev[1::2], ev[2::2]):  # the put expired on a and nothing is open until b
         assert (df.loc[a:b, "coverage"].iloc[:-1] == 0).all() and df.at[a, "premium_paid"] == 0
+
+
+def test_coverage_is_marked_daily_between_events():
+    # a crash between rolls (2019-02-11, before the 02-15 expiry) puts the put in the money and lifts the NAV:
+    # coverage is that day's long notional over that day's NAV, not the last roll's ratio carried forward
+    mkt = _panel(spx=np.r_[np.full(29, S0), np.full(231, 0.7 * S0)])
+    df = sleeves.option_sleeve(mkt, OptionSpec((PUT25,), premium_frac=0.5))
+    legs, nav, ev = df.attrs["legs"], _nav(df), df.index[df["event"]]
+    want = [mkt.at[d, "spx"] * sum(g["n"] for g in _live(legs, d) if g["n"] > 0) / nav[d] for d in mkt.index]
+    np.testing.assert_allclose(df["coverage"], want, rtol=1e-12)
+    assert ev[0] < pd.Timestamp("2019-02-12") < ev[1]
+    assert df.at["2019-02-12", "coverage"] < 0.5 * df.at[ev[0], "coverage"]
 
 
 def test_offset_and_roll_frequency_reach_the_calendar():
