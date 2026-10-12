@@ -1,7 +1,10 @@
 """Tests for insureport.pricing: Black-Scholes-Merton prices and deltas (Hull's textbook values,
 dividend-yield hand values, put-call parity, expiry and zero vol, NaN propagation), the SKEW
-slope and the smile factor A(c), the smile shape (flat at SKEW 100, linear in z on the put wing
-with no flat cap by default, the z_cap knob, the call-wing floor, the nu scaling, flat at expiry),
+slope anchored to the 2026-10-08 chain and damped in SKEW (beta 0 / 0.5 / 1, gamma = 0 guarded, m a pure
+scale, beta 1 = the old Gram-Charlier rule, beta reaching quote and strike_for_delta) and the smile factor
+A(c), the smile shape (flat at SKEW 100, linear in z on the put wing
+with no flat cap by default, the z_cap knob, the call-wing floor, the nu scaling, flat at expiry, nu and
+beta validated),
 the closed-form floored (and capped) factor A_f and variance-swap consistency of the smile, both
 by numerical integration, the monotonicity slope cap c_max(nu, s) (brute-force hand checks on both
 branches, rising in s, the cached table vs the direct solve, the fixed point the smile uses, nu not a
@@ -70,9 +73,26 @@ def test_bs_parity_dividends_expiry_and_nan():
     assert np.isnan(pricing.bs_delta(100, 90, 1, np.nan, 0.05, 0, "P"))
 
 
-def test_skew_slope_and_smile_factor():
-    assert pricing.skew_slope(130, m=1) == pytest.approx(0.5)  # 1 * 30 / 10 / 6
-    assert pricing.skew_slope(90) == 0
+def test_skew_slope_anchored_and_damped():
+    # c = m SLOPE_REF (gamma / GAMMA_REF)^beta, gamma = max(SKEW - 100, 0)/10: the 2026-10-08 chain's slope at its
+    # SKEW 149.19, damped (beta 0.5) away from it
+    assert pricing.skew_slope(149.19) == pytest.approx(0.263, abs=1e-6)
+    assert pricing.skew_slope(100) == 0 and pricing.skew_slope(90) == 0
+    assert pricing.skew_slope(126, beta=1.0) == pytest.approx(0.263 * 2.6 / 4.919, rel=1e-12)  # 0.139012
+    assert pricing.skew_slope(126) == pytest.approx(0.263 * np.sqrt(2.6 / 4.919), rel=1e-12)  # 0.191207
+    skew = np.array([100.5, 110, 126, 149.19, 183, 200])
+    np.testing.assert_allclose(pricing.skew_slope(skew, beta=0.0), 0.263, rtol=1e-15)  # a constant wing
+    assert pricing.skew_slope(np.array([100.0, 95.0]), beta=0.0).tolist() == [0, 0]  # gamma 0 guarded: not 0^0 = 1
+    np.testing.assert_allclose(pricing.skew_slope(skew, m=1.5), 1.5 * pricing.skew_slope(skew), rtol=1e-15)
+    np.testing.assert_allclose(pricing.skew_slope(skew, m=0.5, beta=1.0), 0.5 * pricing.skew_slope(skew, beta=1.0),
+                               rtol=1e-15)
+    # beta = 1 is the old proportional Gram-Charlier rule c = m_old gamma / 6, at m = m_old GAMMA_REF / (6 SLOPE_REF)
+    old = pricing.skew_slope(skew, m=0.3 * 4.919 / (6 * 0.263), beta=1.0)
+    np.testing.assert_allclose(old, 0.3 * (skew - 100) / 10 / 6, rtol=1e-14)
+    assert np.isnan(pricing.skew_slope(np.nan))  # a missing SKEW is not a flat smile
+
+
+def test_smile_factor():
     # A(0.5) = 1 + 0.5/sqrt(2 pi) + 5/32 = 1 + 0.19947114 + 0.15625 = 1.35572114
     assert pricing.smile_factor(0.5) == pytest.approx(1.355721, abs=1e-6)
     assert pricing.smile_factor(0) == 1
@@ -84,30 +104,35 @@ def test_flat_smile_at_skew_100():
 
 
 def test_smile_shape_and_call_wing_floor():
-    c = 0.25  # SKEW 130, m = 0.5: 0.5 * 30 / 10 / 6, below the slope cap (0.513 at this 30 d tenor)
-    s0 = float(pricing.smile_vol(S, F, T, VS, 130, R, Q, m=0.5))  # K = F: z = 0, the ATM vol sigma0
-    # A_f(0.25, inf) = A(c) 1.138798 + floor 8.4e-7 (binds below z = -4) = 1.138799; no cap term
-    assert s0 == pytest.approx(VS / np.sqrt(1.138799), rel=1e-6)
+    # SKEW 149.19 at the defaults: c = SLOPE_REF = 0.263 (the anchor; slice 3d moved this test off SKEW 130,
+    # m 0.5, c = 0.25 under the old c = m gamma / 6), below the slope cap (0.513 at this 30 d tenor)
+    c, sk = 0.263, 149.19
+    s0 = float(pricing.smile_vol(S, F, T, VS, sk, R, Q))  # K = F: z = 0, the ATM vol sigma0
+    # A_f(0.263, inf) = A(c) 1.148152 + floor 2.1e-6 (binds below z = -1/c = -3.80) = 1.148155; no cap term
+    assert s0 == pytest.approx(VS / np.sqrt(1.148155), rel=1e-6)
     K = F * np.exp(-np.array([2.0, 5.0, -2.0, -10.0]) * s0 * np.sqrt(T))  # z = +2, +5, -2, -10
     hand = np.array([s0 * (1 + 2 * c), s0 * (1 + 5 * c), s0 * (1 - c), 0.5 * s0])  # z = 5: still linear
-    np.testing.assert_allclose(pricing.smile_vol(S, K, T, VS, 130, R, Q, m=0.5), hand, rtol=1e-12)
-    # the z_cap knob still flattens the wing: z_cap = 3 gives sigma0 from A_f(0.25, 3) = A(c) + cap -3.471e-4
-    # [2c(3Q - phi) + c^2(8Q - 3 phi), Q = N(-3), phi = phi(3)] + floor = 1.138452, and z = 5 prices as z = 3
-    s3 = float(pricing.smile_vol(S, F, T, VS, 130, R, Q, m=0.5, z_cap=3.0))
-    assert s3 == pytest.approx(VS / np.sqrt(1.138452), rel=1e-6)
+    np.testing.assert_allclose(pricing.smile_vol(S, K, T, VS, sk, R, Q), hand, rtol=1e-12)
+    # the z_cap knob still flattens the wing: z_cap = 3 gives sigma0 from A_f(0.263, 3) = A(c) + cap -3.737e-4
+    # [2c(3Q - phi) + c^2(8Q - 3 phi), Q = N(-3), phi = phi(3)] + floor = 1.147781, and z = 5 prices as z = 3
+    s3 = float(pricing.smile_vol(S, F, T, VS, sk, R, Q, z_cap=3.0))
+    assert s3 == pytest.approx(VS / np.sqrt(1.147781), rel=1e-6)
     K5 = F * np.exp(-5 * s3 * np.sqrt(T))
-    assert pricing.smile_vol(S, K5, T, VS, 130, R, Q, m=0.5, z_cap=3.0) == pytest.approx(s3 * (1 + 3 * c), rel=1e-12)
-    # nu scales the whole smile, floor included (c = 0.25 < the cap at nu 0.8, 0.582, so the slope cap does
+    assert pricing.smile_vol(S, K5, T, VS, sk, R, Q, z_cap=3.0) == pytest.approx(s3 * (1 + 3 * c), rel=1e-12)
+    # nu scales the whole smile, floor included (c = 0.263 < the cap at nu 0.8, 0.582, so the slope cap does
     # not bind); z is still standardised by sigma0, not nu sigma0
-    np.testing.assert_allclose(pricing.smile_vol(S, K, T, VS, 130, R, Q, m=0.5, nu=0.8), 0.8 * hand, rtol=1e-12)
+    np.testing.assert_allclose(pricing.smile_vol(S, K, T, VS, sk, R, Q, nu=0.8), 0.8 * hand, rtol=1e-12)
     assert K[1] < K[0] < F < K[2] < K[3]  # z > 0 is the OTM-put side
     # expired: c_max(nu, 0) = 0, so the smile is flat at nu vs; a missing T is not expiry and stays NaN
     T0 = np.array([0, -0.1])
-    np.testing.assert_allclose(pricing.smile_vol(S, 3000.0, T0, VS, 130, R, Q, m=0.5, nu=1.1), 1.1 * VS, rtol=1e-14)
+    np.testing.assert_allclose(pricing.smile_vol(S, 3000.0, T0, VS, 130, R, Q, m=3.0, nu=1.1), 1.1 * VS, rtol=1e-14)
     assert np.isnan(pricing.smile_vol(S, F, np.nan, VS, 130, R, Q))
     for bad in (0.0, np.nan, np.inf):
         with pytest.raises(ValueError, match="nu"):
             pricing.smile_vol(S, F, T, VS, 130, R, Q, nu=bad)
+    for bad in (-0.5, np.nan, np.inf):  # a negative beta would cheapen the wing as SKEW rises
+        with pytest.raises(ValueError, match="beta"):
+            pricing.smile_vol(S, F, T, VS, 130, R, Q, beta=bad)
 
 
 @pytest.mark.parametrize("z_cap", [2.5, 3.0, 4.0, np.inf])
@@ -126,8 +151,8 @@ def test_floored_smile_factor_closed_form(c, z_cap):
 @pytest.mark.parametrize("z_cap", [np.inf, 3.0])
 @pytest.mark.parametrize("c", [0.1, 0.3, 0.6])
 def test_smile_is_variance_swap_consistent(c, z_cap, nu, t):
-    skew = 100 + 60 * c  # with m = 1, c = (SKEW - 100) / 60
-    kw = {"m": 1, "z_cap": z_cap, "nu": nu}
+    skew = 130.0  # beta 0: c = m SLOPE_REF at any SKEW above 100
+    kw = {"m": c / pricing.SLOPE_REF, "beta": 0.0, "z_cap": z_cap, "nu": nu}
     f = S * np.exp((R - Q) * t)
     s0 = float(pricing.smile_vol(S, f, t, VS, skew, R, Q, **kw)) / nu  # K = F: z = 0, nu sigma0
     # 0.6 is above the cap (0.513 / 0.46) at 30 d, below it (0.714 / 0.650) at 0.5 y
@@ -179,41 +204,44 @@ def test_max_slope_rising_in_s_and_table():
 
 
 def test_steep_slope_capped_at_the_fixed_point():
-    # SKEW 183, m 0.7: c = 0.968 is above the cap at 30 d. The smile uses c* = c_max(nu, sigma0(c*) sqrt T),
-    # the slope whose own sigma0 makes it exactly safe (sigma0 falls as c rises, c_max rises with s)
+    # SKEW 183, m 3: c = 3 x 0.263 (8.3 / 4.919)^0.5 = 1.025 is above the cap at 30 d (0.44-0.58; the old rule's
+    # m 0.7 gave 0.968). The smile uses c* = c_max(nu, sigma0(c*) sqrt T), the slope whose own sigma0 makes it
+    # exactly safe (sigma0 falls as c rises, c_max rises with s)
+    assert pricing.skew_slope(183, 3.0) == pytest.approx(1.025, abs=1e-3)
     for nu in (0.8, 1.0, 1.3):
         cap = float(pricing._slope_cap(T, VS, nu, np.inf))
-        s0 = float(pricing.smile_vol(S, F, T, VS, 183, R, Q, m=0.7, nu=nu)) / nu
+        s0 = float(pricing.smile_vol(S, F, T, VS, 183, R, Q, m=3.0, nu=nu)) / nu
         assert s0 == pytest.approx(VS / np.sqrt(pricing._floored_smile_factor(cap, np.inf)), rel=1e-12)
         exact = float(pricing._max_slope(nu, s0 * np.sqrt(T)))
-        assert cap <= exact and cap == pytest.approx(exact, rel=1e-4) and cap < 0.968
+        assert cap <= exact and cap == pytest.approx(exact, rel=1e-4) and cap < 1.025
         K = F * np.exp(-np.array([1.0, 5.0, -1.0]) * s0 * np.sqrt(T))  # z = 1, 5, -1
         hand = nu * s0 * np.array([1 + cap, 1 + 5 * cap, 1 - cap / 2])
-        np.testing.assert_allclose(pricing.smile_vol(S, K, T, VS, 183, R, Q, m=0.7, nu=nu), hand, rtol=1e-12)
+        np.testing.assert_allclose(pricing.smile_vol(S, K, T, VS, 183, R, Q, m=3.0, nu=nu), hand, rtol=1e-12)
     # the cap is per tenor: tighter at 7 d than at 30 d, looser at 1 y
     caps = pricing._slope_cap(np.array([7, 30, 365]) / 365, VS, 1.0, np.inf)
     assert (np.diff(caps) > 0).all()
     # where it binds nu is not a pure scale: c*(nu 1.2) < c*(nu 1), so the ATM vol rises by more than 1.2x
-    # (sigma0 = vs / sqrt(A_f(c*))) and the 25% OTM vol by less (61 d, SKEW 183, m 0.7)
+    # (sigma0 = vs / sqrt(A_f(c*))) and the 25% OTM vol by less (61 d, SKEW 183, m 3)
     t, f = 61 / 365, S * np.exp((R - Q) * 61 / 365)
     a1, a2 = (pricing._floored_smile_factor(pricing._slope_cap(t, VS, n, np.inf), np.inf) for n in (1.0, 1.2))
-    v1, v2 = (pricing.smile_vol(S, np.array([f, 0.75 * S]), t, VS, 183, R, Q, m=0.7, nu=n) for n in (1.0, 1.2))
+    v1, v2 = (pricing.smile_vol(S, np.array([f, 0.75 * S]), t, VS, 183, R, Q, m=3.0, nu=n) for n in (1.0, 1.2))
     atm, otm = v2 / v1
     assert atm == pytest.approx(1.2 * np.sqrt(a1 / a2), rel=1e-12) and atm > 1.2 + 1e-3
     assert 1 < otm < 1.2
 
 
 def test_lee_bound_guards_the_extreme_tail():
-    # far from binding at z <= 12 for ordinary inputs (vs 0.15, SKEW 149, m 0.3: still linear at z = 12) ...
+    # far from binding at z <= 12 for ordinary inputs (vs 0.15, SKEW 149, the defaults: still linear at z = 12) ...
     for t in (1 / 365, 1.0):
-        f, s0 = S * np.exp((R - Q) * t), float(pricing.smile_vol(S, S * np.exp((R - Q) * t), t, 0.15, 149, R, Q, m=0.3))
-        c = float(pricing.smile_vol(S, f * np.exp(-s0 * np.sqrt(t)), t, 0.15, 149, R, Q, m=0.3)) / s0 - 1  # z = 1
-        z12 = pricing.smile_vol(S, f * np.exp(-12 * s0 * np.sqrt(t)), t, 0.15, 149, R, Q, m=0.3)
+        f, s0 = S * np.exp((R - Q) * t), float(pricing.smile_vol(S, S * np.exp((R - Q) * t), t, 0.15, 149, R, Q))
+        c = float(pricing.smile_vol(S, f * np.exp(-s0 * np.sqrt(t)), t, 0.15, 149, R, Q)) / s0 - 1  # z = 1
+        z12 = pricing.smile_vol(S, f * np.exp(-12 * s0 * np.sqrt(t)), t, 0.15, 149, R, Q)
         assert z12 == pytest.approx(s0 * (1 + 12 * c), rel=1e-12)
-    # ... but with vs 0.8, SKEW 200, m 1, nu 1.5 at 7 d (c = 0.526, sigma0 sqrt T = 0.094) the linear wing
-    # at k = ln(K/F) = -3 would ask for sigma = nu sigma0 (1 + c z) = 18.12 > Lee's sqrt(2 |k| / T) = 17.69
-    # (the far crossing is at k = -2.84): clipped to the bound
-    t, kw = 7 / 365, {"m": 1.0, "nu": 1.5}
+    # ... but with vs 0.8, SKEW 200, m 5, nu 1.5 at 7 d (the raw c = 1.875 capped to 0.526, sigma0 sqrt T = 0.094;
+    # any slope above the cap gives these numbers) the linear wing at k = ln(K/F) = -3 would ask for
+    # sigma = nu sigma0 (1 + c z) = 18.12 > Lee's sqrt(2 |k| / T) = 17.69 (the far crossing is at k = -2.84):
+    # clipped to the bound
+    t, kw = 7 / 365, {"m": 5.0, "nu": 1.5}
     f = S * np.exp((R - Q) * t)
     s0 = float(pricing.smile_vol(S, f, t, 0.8, 200, R, Q, **kw)) / 1.5
     c = float(pricing.smile_vol(S, f * np.exp(-s0 * np.sqrt(t)), t, 0.8, 200, R, Q, **kw)) / (1.5 * s0) - 1  # z = 1
@@ -231,15 +259,16 @@ def test_lee_bound_guards_the_extreme_tail():
 
 
 def test_lee_root_kept_by_the_slope_cap():
-    # vs 0.45 at 13 months (VIX1Y in a crash), SKEW 183, m 0.7, nu 1.3: the monotonicity cap alone allows
-    # c = 0.968 and 2 nu^2 c s = 1.09 > 1, where the linear wing never meets Lee's bound (sigma^2 T / |k| was
-    # 5.9 at k = -3, 17 at k = -10). _slope_cap also caps c at (1 - 1e-6)^2 / (2 nu^2 vs sqrt T) = 0.628
-    t, kw = 400 / 365, {"m": 0.7, "nu": 1.3}
+    # vs 0.45 at 13 months (VIX1Y in a crash), SKEW 183, m 2.8, nu 1.3: the monotonicity cap alone allows
+    # c = 0.957 and 2 nu^2 c s = 1.08 > 1 (s = sigma0 sqrt T at that c), where the linear wing never meets Lee's
+    # bound (sigma^2 T / |k| was 5.9 at k = -3, 17 at k = -10 at the old rule's c = 0.968). _slope_cap also caps c
+    # at (1 - 1e-6)^2 / (2 nu^2 vs sqrt T) = 0.628
+    t, kw = 400 / 365, {"m": 2.8, "nu": 1.3}
     f = S * np.exp((R - Q) * t)
     lee = (1 - 1e-6) ** 2 / (2 * 1.3**2 * 0.45 * np.sqrt(t))
     assert float(pricing._slope_cap(t, 0.45, 1.3, np.inf)) == pytest.approx(lee, rel=1e-12)
     s_lee = 0.45 / np.sqrt(pricing._floored_smile_factor(lee, np.inf)) * np.sqrt(t)  # sigma0 sqrt T at c = lee
-    assert lee < pricing.skew_slope(183, 0.7) and lee < pricing._c_max(1.3, s_lee)  # the Lee cap is the one binding
+    assert lee < pricing.skew_slope(183, 2.8) and lee < pricing._c_max(1.3, s_lee)  # the Lee cap is the one binding
     k = np.array([-3.0, -6.0, -10.0])
     sig = pricing.smile_vol(S, f * np.exp(k), t, 0.45, 183, R, Q, **kw)
     np.testing.assert_allclose(sig**2 * t / -k, 2 * (1 - 1e-6) ** 2, rtol=1e-12)  # on Lee's segment
@@ -249,10 +278,11 @@ def test_lee_root_kept_by_the_slope_cap():
 
 
 def test_deep_linear_wing_breaks_convexity():
-    # the smile_vol LIMIT, pinned so it stays visible: at vs 0.15, SKEW 183, m 0.3 (c = 0.415), 30 d, the
-    # wing is concave in K from z ~ 25 (K/S < 0.39) and the 0.25 / 0.30 / 0.35 S put butterfly costs -0.0067
-    p25, p30, p35 = pricing.quote(1000.0, np.array([250.0, 300, 350]), 30 / 365, 0.15, 183, 0.03, 0.015, h=0, m=0.3)[0]
-    assert p25 - 2 * p30 + p35 == pytest.approx(-0.0067, abs=1e-4)
+    # the smile_vol LIMIT, pinned so it stays visible: at vs 0.15, SKEW 183 (c = 0.342 at the defaults; the old
+    # rule's m 0.3 gave c = 0.415, concave from z ~ 25, K/S < 0.39, and a 0.25 / 0.30 / 0.35 S fly of -0.0067), 30 d,
+    # the wing is concave in K from z ~ 33 (K/S < 0.28) and the 0.15 / 0.20 / 0.25 S put butterfly costs -0.0026
+    p15, p20, p25 = pricing.quote(1000.0, np.array([150.0, 200, 250]), 30 / 365, 0.15, 183, 0.03, 0.015, h=0)[0]
+    assert p15 - 2 * p20 + p25 == pytest.approx(-0.0026, abs=1e-4)
 
 
 _GRID_T = np.array([1 / 365, 7 / 365, 30 / 365, 60 / 365, 0.5, 1.0])[:, None, None, None]
@@ -262,35 +292,40 @@ _GRID_SKEW = np.array([110.0, 130, 150, 183])[None, None, :, None]
 
 @pytest.mark.parametrize("z_cap", [np.inf, 3.0])
 @pytest.mark.parametrize("nu", [0.8, 1.0, 1.3])
-@pytest.mark.parametrize("m", [0.3, 0.5, 0.7])
-def test_put_mids_non_decreasing_in_strike(m, nu, z_cap):
-    # T x vs x SKEW broadcast in one call; SKEW 183 is the 2025 high, nu either side of 1, z_cap the knob
+@pytest.mark.parametrize("m, beta", [(1.0, 0.0), (1.0, 0.5), (3.0, 1.0)])
+def test_put_mids_non_decreasing_in_strike(m, beta, nu, z_cap):
+    # T x vs x SKEW broadcast in one call; SKEW 183 is the 2025 high, nu either side of 1, z_cap the knob; the
+    # slope runs 0.12-0.34 at the defaults, 0.263 flat at beta 0 and 0.16-1.33 (the cap binding) at m 3, beta 1
     K = S * np.arange(60, 201) / 200  # 0.30 S ... 1.00 S, step 0.005 S
-    mid = pricing.quote(S, K, _GRID_T, _GRID_VS, _GRID_SKEW, R, Q, "P", m=m, nu=nu, z_cap=z_cap)[0]
+    kw = {"m": m, "beta": beta, "nu": nu, "z_cap": z_cap}
+    mid = pricing.quote(S, K, _GRID_T, _GRID_VS, _GRID_SKEW, R, Q, "P", **kw)[0]
     assert mid.shape == (6, 3, 4, 141)
     assert (np.diff(mid, axis=-1) >= -1e-9).all()
     # that grid holds only a few points of the 1 d and 7 d wing, so also step in standardized moneyness,
     # z from 15 down to -2 (K rising), across the linear wing (and Lee's bound where it binds) at every tenor
     z = np.linspace(15, -2, 1001)
     Kz = S * np.exp((R - Q) * _GRID_T) * np.exp(-z * _GRID_VS * np.sqrt(_GRID_T))
-    mid = pricing.quote(S, Kz, _GRID_T, _GRID_VS, _GRID_SKEW, R, Q, "P", m=m, nu=nu, z_cap=z_cap)[0]
+    mid = pricing.quote(S, Kz, _GRID_T, _GRID_VS, _GRID_SKEW, R, Q, "P", **kw)[0]
     assert (np.diff(mid, axis=-1) >= -1e-9).all()
 
 
 def test_far_put_non_decreasing_in_skew():
     # a higher SKEW never cheapens the 25% OTM 2-month put (Universa preset), also past the SKEW where
-    # c_max binds at m 0.7 and the slope stops steepening (the cap does not depend on SKEW)
-    mid = pricing.quote(S, 0.75 * S, 61 / 365, VS, np.arange(120, 201), R, Q, m=0.7)[0]
-    assert (np.diff(mid) >= -1e-9).all()
+    # c_max binds at m 2 (SKEW 161: 0.584 at 61 d) and the slope stops steepening (the cap does not depend on SKEW)
+    for m in (1.0, 2.0):
+        mid = pricing.quote(S, 0.75 * S, 61 / 365, VS, np.arange(120, 201), R, Q, m=m)[0]
+        assert (np.diff(mid) >= -1e-9).all()
 
 
 def test_review_counterexamples_fixed():
-    # slice-3 review, r = q = 0: the uncapped wing gave P(0.30 S) = 64.5 > P(0.96 S) = 17.5 at 7 d
-    p30, p96 = pricing.quote(S, np.array([0.30, 0.96]) * S, 7 / 365, 0.15, 160, 0, 0, "P", m=0.7)[0]
+    # slice-3 review, r = q = 0, SKEW 160 at slope 0.7: the uncapped wing gave P(0.30 S) = 64.5 > P(0.96 S) = 17.5
+    # at 7 d. m 3 asks for 0.871, capped at 0.357: 1.07 < 6.98 (the defaults' 0.290 is below the cap: 0.12 < 5.38)
+    p30, p96 = pricing.quote(S, np.array([0.30, 0.96]) * S, 7 / 365, 0.15, 160, 0, 0, "P", m=3.0)[0]
     assert p30 < p96
     # ... and a 25% OTM put still decays to 0 as T -> 0+ (the slope cap goes to 0 with s), through the
-    # linear wing rather than a flat one: about 0.04 points of 4000 at 1 d, nothing at 30 s
-    mid = pricing.quote(4000.0, 3000.0, np.array([1 / 365, 1e-6]), 0.15, 150, 0, 0, "P", m=0.5)[0]
+    # linear wing rather than a flat one: about 0.01 points of 4000 at 1 d (the defaults' 0.265 capped to 0.254),
+    # nothing at 30 s
+    mid = pricing.quote(4000.0, 3000.0, np.array([1 / 365, 1e-6]), 0.15, 150, 0, 0, "P")[0]
     assert mid[0] < 0.1 and mid[1] < 1e-9
 
 
@@ -299,33 +334,39 @@ def test_wing_iv_falls_with_tenor_in_contango():
     # 0.49 -> 0.44 -> 0.39 -> 0.37 over 29 -> 84 d although vs rises (contango); a linear wing in z falls too
     # (z shrinks as sqrt T grows), where the flat wing rose with vs. The sign, not the level. With that day's
     # own term structure (var_swap_vol of the pillars: 0.154 / 0.177 / 0.180) the model IV falls
-    # 0.457 -> 0.368 -> 0.355
+    # 0.478 -> 0.382 -> 0.367 at the defaults (0.457 -> 0.368 -> 0.355 under the old c = 0.3 gamma / 6)
     days = np.array([29, 71, 84])
     vs = pricing.var_swap_vol(days / 365, 12.21, 15.41, 18.08, 20.04)
-    iv = pricing.smile_vol(S, 0.70 * S, days / 365, vs, 149, R, Q, m=0.3)
+    iv = pricing.smile_vol(S, 0.70 * S, days / 365, vs, 149, R, Q)
     assert (np.diff(iv) < 0).all()
     # DEVIATION from the brief: its vs 0.154 / 0.181 / 0.200 (the VIX / VIX3M / VIX6M levels placed at
-    # 29 / 71 / 84 d, a 28% forward vol from 71 to 84 d) give 0.4569 / 0.3717 / 0.3738, so only the fall from
+    # 29 / 71 / 84 d, a 28% forward vol from 71 to 84 d) give 0.4784 / 0.3851 / 0.3861, so only the fall from
     # 29 d is asserted there (the 71 -> 84 d step is not pinned either way)
-    iv = pricing.smile_vol(S, 0.70 * S, days / 365, np.array([0.154, 0.181, 0.200]), 149, R, Q, m=0.3)
+    iv = pricing.smile_vol(S, 0.70 * S, days / 365, np.array([0.154, 0.181, 0.200]), 149, R, Q)
     assert iv[1] < iv[0] and iv[2] < iv[0]
 
 
 def test_xsp_quotes_anchor_loosely():
     """The 2026-10-08 close of the Cboe delayed XSP chain: S 776.54, VIX9D / VIX / VIX3M /
-    VIX6M 12.21 / 15.41 / 18.08 / 20.04, SKEW 149.19, r = ln(1.04043), q = 1.2%, m 0.3, nu 1. Market
-    mid at K/S 0.70 (% of spot) over model mid, measured: 1.51 at 29 d, 1.49 at 43 d, 1.34 at 71 d,
-    1.25 at 84 d (model IV 0.457 / 0.414 / 0.368 / 0.355 vs the market's 0.478 / 0.434 / 0.383 / 0.366;
-    the flat z_cap 3 wing at m 0.3 gave ~64,000x, 314x, 11.6x, 5.8x). One calm day: asserted within
-    3x (10x at 29 d), not pinned."""
+    VIX6M 12.21 / 15.41 / 18.08 / 20.04, SKEW 149.19, r = ln(1.04043), q = 1.2%, the defaults (c = SLOPE_REF
+    0.263 at this SKEW, whatever beta), nu 1. Market mid at K/S 0.70 (% of spot) over model mid, measured:
+    0.96 at 29 d, 1.05 at 43 d, 1.04 at 71 d, 1.00 at 84 d (model IV 0.478 / 0.431 / 0.381 / 0.367 vs the
+    market's 0.478 / 0.434 / 0.383 / 0.366; the old c = 0.3 gamma / 6 = 0.246 gave 1.51 / 1.49 / 1.34 / 1.25,
+    the flat z_cap 3 wing ~64,000x, 314x, 11.6x, 5.8x). One calm day: asserted within 2x, not pinned.
+    The SKEW sensitivity is the assumption: at SKEW 126 (the 2018-19 median) with the same vols the 84-day
+    30% OTM put is 0.035% of spot at beta 0.5 (0.104% at beta 0, 0.009% under the old rule), asserted
+    in 0.02% .. 0.08%."""
     S0, r, q = 776.54, np.log(1.04043), 0.012
     days = np.array([29, 43, 71, 84])
     market = np.array([0.013, 0.032, 0.081, 0.104]) / 100
     vs = pricing.var_swap_vol(days / 365, 12.21, 15.41, 18.08, 20.04)
-    model = pricing.quote(S0, 0.70 * S0, days / 365, vs, 149.19, r, q, "P", m=0.3, nu=1.0)[0] / S0
+    model = pricing.quote(S0, 0.70 * S0, days / 365, vs, 149.19, r, q, "P", nu=1.0)[0] / S0
     ratio = market / model
     print("market / model at K/S 0.70:", dict(zip(days.tolist(), ratio.round(2).tolist())))
-    assert 0.1 < ratio[0] < 10 and ((1 / 3 < ratio[1:]) & (ratio[1:] < 3)).all()
+    assert ((0.5 < ratio) & (ratio < 2)).all()
+    put126 = float(pricing.quote(S0, 0.70 * S0, 84 / 365, vs[3], 126.0, r, q, "P")[0]) / S0
+    print(f"84 d K/S 0.70 put at SKEW 126: {put126:.4%} of spot")
+    assert 0.0002 < put126 < 0.0008
 
 
 def test_var_swap_term_structure():
@@ -468,8 +509,20 @@ def test_quote_spread_rule():
     assert (bid0 == mid0).all() and (ask0 == mid0).all() and (mid0 == mid).all()  # h = 0: mid fills
 
 
+def test_beta_moves_the_far_put_quote():
+    # SKEW 130 (gamma 3, not GAMMA_REF): beta moves the slope, 0.263 (3 / 4.919)^beta = 0.263 / 0.205 / 0.160 at
+    # beta 0 / 0.5 / 1, so a 20% OTM 1-month put (z ~ 4) is dearer the less SKEW damps the wing
+    far = [float(pricing.quote(S, 0.80 * S, T, VS, 130, R, Q, beta=b)[0]) for b in (0.0, 0.5, 1.0)]
+    assert far[0] > far[1] > far[2] > 0
+    assert far[1] == float(pricing.quote(S, 0.80 * S, T, VS, 130, R, Q)[0])  # the default is SKEW_BETA
+    # (beta reaching smile_vol through quote and strike_for_delta: test_quote_and_strike_pass_keywords_through)
+    # at the anchor SKEW 149.19 (gamma = GAMMA_REF) beta changes nothing
+    at_ref = [float(pricing.quote(S, 0.80 * S, T, VS, 149.19, R, Q, beta=b)[0]) for b in (0.0, 1.0)]
+    assert at_ref[0] == pytest.approx(at_ref[1], rel=1e-12)
+
+
 def test_quote_and_strike_pass_keywords_through():
-    K, kw = np.array([3900.0, 4200]), {"m": 0.7, "nu": 1.1, "z_cap": 2.5}
+    K, kw = np.array([3900.0, 4200]), {"m": 0.7, "nu": 1.1, "z_cap": 2.5, "beta": 1.0}
     mid, _, ask = pricing.quote(S, K, T, VS, 130, R, Q, "C", h=0.1, **kw)
     vol = pricing.smile_vol(S, K, T, VS, 130, R, Q, **kw)
     np.testing.assert_allclose(mid, pricing.bs_price(S, K, T, vol, R, Q, "C"), rtol=1e-14)
@@ -502,13 +555,14 @@ def test_strike_for_delta():
         pricing.strike_for_delta(S, T, VS, 130, R, Q, 1.5)
     with pytest.raises(ValueError):
         pricing.strike_for_delta(S, T, np.nan, 130, R, Q, 0.05)
-    # the linear wing keeps far strikes' delta alive: at 61 d, vs 0.15, SKEW 183 the 0.005 (dao_ch9) and
-    # 0.001 put strikes lie past ln(K/F) = -1.5 (|delta| 0.0053 there), inside the [-8, 1] bracket (m 0.3)
+    # the linear wing keeps far strikes' delta alive: at 61 d, vs 0.15, SKEW 183 (c = 0.342 at the defaults) the
+    # 0.005 (dao_ch9) put strike lies at ln(K/F) = -0.77 and the 0.001 one past -1.5 (|delta| 0.0017 there; the old
+    # rule's c = 0.415 put both past it), inside the [-8, 1] bracket
     t = 61 / 365
-    for d in (0.005, 0.001):
-        Kd = pricing.strike_for_delta(S, t, 0.15, 183, R, Q, d, m=0.3)
-        assert Kd < S * np.exp((R - Q) * t - 1.5)
-        vol_d = pricing.smile_vol(S, Kd, t, 0.15, 183, R, Q, m=0.3)
+    for d, k in ((0.005, -0.75), (0.001, -1.5)):
+        Kd = pricing.strike_for_delta(S, t, 0.15, 183, R, Q, d)
+        assert Kd < S * np.exp((R - Q) * t + k)
+        vol_d = pricing.smile_vol(S, Kd, t, 0.15, 183, R, Q)
         assert pricing.bs_delta(S, Kd, t, vol_d, R, Q, "P") == pytest.approx(-d, rel=1e-6)
 
 

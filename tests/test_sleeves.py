@@ -18,7 +18,7 @@ pass-through (expiries move with offset rolls), rolls before the first usable pr
 NaN input day on a quiet day and on a crash expiry (model inputs carried, spot not) and a
 partial-pillar day (not a fallback), the expiry-week return-rounding limit, cash accrual and the
 rates, dividends, VIX pillars (VIX1Y on a 13-month put) and smile knobs reaching the pricer, the
-term-structure back-fill, a delta-targeted strike, z_cap reaching the quotes and the delta strike,
+term-structure back-fill, a delta-targeted strike, z_cap and beta reaching the quotes and the delta strike,
 spec validation, the T-bill sleeve, the par-bond proxy, long/flat time-series momentum and the build
 time of a Universa-like sleeve on a 9,000-day panel.
 
@@ -55,7 +55,7 @@ def _panel(periods: int = 260, start: str = "2019-01-01", **cols) -> pd.DataFram
 def _quote(leg: dict, t: pd.Timestamp, S: float = S0, vols: tuple = (20.0,) * 5, rf: float = 0.0, q: float = 0.0,
            **kw) -> tuple:
     """(mid, bid, ask) of an attrs["legs"] entry on date t: SKEW 130, VIX pillars `vols` (vix9d, vix,
-    vix3m, vix6m[, vix1y]), r = ln(1 + rf), q; kw (m, nu, h, z_cap) passed to pricing.quote."""
+    vix3m, vix6m[, vix1y]), r = ln(1 + rf), q; kw (m, nu, h, z_cap, beta) passed to pricing.quote."""
     T = (leg["expiry"] - t).days / 365
     return pricing.quote(S, leg["K"], T, pricing.var_swap_vol(T, *vols), 130.0, np.log1p(rf), q, leg["cp"], **kw)
 
@@ -508,7 +508,8 @@ def test_expiry_week_payoff_is_lost_to_return_rounding():
     assert df.at[pd.Timestamp("2019-02-13"), "ret"] == -1.0  # the mark fell below 1e-16 of the day before
     assert g["closed_on"] == pd.Timestamp("2019-02-15") and g["n"] * (0.75 - 0.7) * S0 > 1000  # settled > 1000x
     assert _nav(df)["2019-02-15"] == 0.0
-    # the linear wing (z_cap inf) keeps the mark alive into expiry (-30% on 02-13), so the payoff lands: ~600x
+    # the linear wing (z_cap inf) keeps the mark alive into expiry (-94% on 02-13), so the payoff lands: ~4000x.
+    # m 0.5 is c ~0.10 at the panel's SKEW 130 on the anchored slope (0.25 under the old c = m gamma / 6)
     nav = _nav(sleeves.option_sleeve(mkt, OptionSpec((PUT25,)), m=0.5))
     assert nav["2019-02-13"] > 0 and nav["2019-02-15"] > 100
 
@@ -556,15 +557,19 @@ def test_delta_leg_strike():
     assert g["K"] == pytest.approx(pricing.strike_for_delta(S0, T, 0.2, 130.0, 0.0, 0.0, 0.05, "P"), rel=1e-12)
 
 
-def test_z_cap_reaches_quotes_and_delta_strikes():
+# z_cap 2.5: the 25% OTM put sits at z ~ 5, beyond the flat-wing cap; beta 1: the panel's SKEW 130 is off the
+# anchor (gamma 3 vs GAMMA_REF 4.919), so the proportional rule flattens the wing
+@pytest.mark.parametrize("kw", [{"z_cap": 2.5}, {"beta": 1.0}])
+def test_smile_knob_reaches_quotes_and_delta_strikes(kw):
     mkt = _panel(periods=30)
-    g = sleeves.option_sleeve(mkt, OptionSpec((PUT25,)), z_cap=2.5).attrs["legs"][0]  # z ~ 5: beyond either cap
-    assert g["unit_cost"] == pytest.approx(_quote(g, g["open_date"], z_cap=2.5)[2], rel=1e-12)
+    g = sleeves.option_sleeve(mkt, OptionSpec((PUT25,)), **kw).attrs["legs"][0]
+    assert g["unit_cost"] == pytest.approx(_quote(g, g["open_date"], **kw)[2], rel=1e-12)
     assert g["unit_cost"] != pytest.approx(_quote(g, g["open_date"])[2], rel=1e-3)
-    d = sleeves.option_sleeve(mkt, OptionSpec((Leg("P", delta=0.01),)), z_cap=2.5).attrs["legs"][0]
+    d = sleeves.option_sleeve(mkt, OptionSpec((Leg("P", delta=0.01),)), **kw).attrs["legs"][0]
     T = (d["expiry"] - d["open_date"]).days / 365
-    K = pricing.strike_for_delta(S0, T, 0.2, 130.0, 0.0, 0.0, 0.01, "P", z_cap=2.5)
-    assert d["K"] == pytest.approx(K, rel=1e-12)
+    args = (S0, T, 0.2, 130.0, 0.0, 0.0, 0.01, "P")
+    assert d["K"] == pytest.approx(pricing.strike_for_delta(*args, **kw), rel=1e-12)
+    assert d["K"] != pytest.approx(pricing.strike_for_delta(*args), rel=1e-4)
 
 
 @pytest.mark.parametrize(
@@ -634,7 +639,9 @@ def test_universa_sleeve_builds_fast():
          "rf": 0.03, "q": 0.02},
         index=pd.bdate_range("1990-01-02", periods=n),
     )
-    spec = OptionSpec((Leg("P", otm=0.25, tenor_months=2, hold_months=1),), monetize_mult=5.0)
+    # monetize at 3x: on this panel (SKEW 115-135) the anchored slope (slice 3d) prices the 25% OTM put above
+    # the old c = 0.3 gamma / 6 did, and 5x never triggers
+    spec = OptionSpec((Leg("P", otm=0.25, tenor_months=2, hold_months=1),), monetize_mult=3.0)
     t0 = time.perf_counter()
     df = sleeves.option_sleeve(mkt, spec)
     took = time.perf_counter() - t0

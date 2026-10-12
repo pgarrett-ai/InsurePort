@@ -6,8 +6,9 @@ pandas Series; pandas inputs are used positionally (np.asarray), never index-ali
 result is an ndarray. NaN inputs give NaN outputs, except: bs_price / bs_delta return intrinsic
 (delta 0 / +-1) when T <= 0 or sigma <= 0 even if r, q or the other of T / sigma is NaN;
 smile_vol at T <= 0 returns nu vs (flat) whatever S, K, r and q are; var_swap_vol skips NaN pillars.
-The smile knobs m and nu are finite scalars, nu > 0 (smile_vol raises ValueError on any other nu), and
-z_cap is a scalar in [0, inf] (default inf: the put wing stays linear out to Lee's bound).
+The smile knobs m, beta and nu are finite scalars, beta >= 0, nu > 0 (skew_slope raises ValueError on any
+other beta, smile_vol on any other nu), and z_cap is a scalar in [0, inf] (default inf: the put wing stays
+linear out to Lee's bound).
 
 Units: S, K and prices in index points; T in years; sigma, vs, r, q decimals; the vol indices
 (vix9d, vix, vix3m, vix6m, vix1y) and skew in index points, as stored in the market panel.
@@ -22,7 +23,11 @@ from scipy.optimize import brentq
 from scipy.special import erfcx, ndtr
 from scipy.stats import norm
 
-SKEW_MULT: float = 0.3  # anchored to the observed SPX smile slope: IV/vs = 0.968 + 0.263 z at SKEW 149.19 (docs/research/gap-3-q9 A), i.e. m = 0.263 * 6 / 4.919 = 0.32; PPUT replication validates it (scripts/calibrate.py)
+SLOPE_REF: float = 0.263  # observed SPX smile slope: IV/vs = 0.968 + 0.263 z (docs/research/gap-3-q9 A, 2026-10-08)
+GAMMA_REF: float = 4.919  # gamma = (SKEW - 100)/10 on that day, SKEW 149.19
+SKEW_BETA: float = 0.5  # slope elasticity to gamma: 0 = constant wing, 1 = proportional (Gram-Charlier); ASSUMPTION
+SKEW_MULT: float = 1.0  # pure scale on the anchored slope (skew_slope); not fitted: at m 1 the Cboe PPUT replica
+# fails dCAGR out of sample (figures/validation_table.md)
 HALF_SPREAD_MIN: float = 0.05  # SPX index points (the minimum tick)
 PILLARS_DAYS = (9, 30, 93, 184, 365)  # VIX9D, VIX, VIX3M, VIX6M, VIX1Y (Cboe's target tenors)
 Z_CAP: float = np.inf  # standardized moneyness past which the put wing goes flat: never, by default
@@ -110,14 +115,34 @@ def var_swap_vol(
     return np.select([has_lo & has_hi, has_lo, has_hi], [inside, v_lo, v_hi], np.nan)
 
 
-def skew_slope(skew: ArrayLike, m: float = SKEW_MULT) -> np.ndarray:
-    """Put-wing slope per unit of standardized moneyness: c = m * gamma / 6, gamma = max(SKEW - 100, 0)/10.
+def skew_slope(skew: ArrayLike, m: float = SKEW_MULT, beta: float = SKEW_BETA) -> np.ndarray:
+    """Put-wing slope per unit of standardized moneyness, anchored to an observed chain and damped in SKEW:
+    c = m SLOPE_REF (gamma / GAMMA_REF)^beta, gamma = max(SKEW - 100, 0)/10; c = 0 at gamma = 0 for every
+    beta >= 0 (no 0^0 = 1), NaN for a NaN SKEW.
 
-    Cboe defines SKEW = 100 - 10 S with S the 30-day risk-neutral skewness, so gamma = -S for
-    negative skew; c = gamma/6 is the first-order Gram-Charlier smile slope (Backus-Foresi-Wu
-    2004) and m scales it (calibrated on PPUT in slice 5).
+    Cboe defines SKEW = 100 - 10 S with S the 30-day risk-neutral skewness, so gamma = -S for negative
+    skew. The first-order Gram-Charlier smile (Backus-Foresi-Wu 2004) has c = gamma/6, which makes the
+    whole smile slope proportional to SKEW; beta = 1 is that rule (with m_old gamma/6 at m = m_old
+    GAMMA_REF / (6 SLOPE_REF)). c is also the slope of IV/vs in z_vs = -ln(K/F)/(vs sqrt T) (smile_vol:
+    IV/vs = nu (sigma0/vs + c z_vs)), so SLOPE_REF = 0.263 is the 2026-10-08 Cboe XSP chain's fit at its
+    SKEW 149.19 (GAMMA_REF 4.919; docs/research/gap-3-q9 A), reproduced exactly there at m = 1.
+    Why damped: under c = 0.3 gamma/6 the 30% OTM ~80-day put was 0.083% of spot at SKEW 149 (the chain:
+    0.104%), 0.044% at SKEW 142 and 0.004% at the 2018-19 median SKEW 126, ~25x below plausible market
+    levels, so the budget presets bought 10-25x a real desk's notional; deep-wing richness in standardized
+    moneyness is empirically far more stable than SKEW. At beta = 0.5 the 1990-2026 average SKEW (~122,
+    gamma ~2.2) gives c ~0.176, the level the realized-payoff test of docs/research/gap-4-q10 found
+    roughly fair, while SKEW 149.19 keeps the chain's slope.
+    ASSUMPTION: one chain cannot estimate the SKEW sensitivity, so beta is a disclosed modelling choice and
+    a sensitivity knob, swept over {0, 0.5, 1} in the case study; m scales the anchored slope (the app's
+    m x {0.5 .. 1.5} sweep). Raises ValueError unless beta is finite and >= 0 (a negative beta cheapens the
+    wing as SKEW rises).
     """
-    return m * np.maximum(np.asarray(skew, dtype=float) - 100, 0) / 10 / 6
+    if not (np.isfinite(beta) and beta >= 0):
+        raise ValueError(f"beta must be finite and >= 0, got {beta}")
+    g = np.maximum(np.asarray(skew, dtype=float) - 100, 0) / 10
+    # ponytail: one chain anchors SLOPE_REF and beta is assumed; regress chain slopes on SKEW across dates to fit
+    # beta once chains.py holds a panel of chains
+    return m * SLOPE_REF * np.where(g > 0, (g / GAMMA_REF) ** beta, g)  # NaN > 0 is False: NaN passes through
 
 
 def smile_factor(c: ArrayLike) -> np.ndarray:
@@ -237,6 +262,7 @@ def smile_vol(
     m: float = SKEW_MULT,
     nu: float = 1.0,
     z_cap: float = Z_CAP,
+    beta: float = SKEW_BETA,
 ) -> np.ndarray:
     """Implied vol (decimal) at strike K and tenor T, given the variance-swap vol vs (decimal).
 
@@ -247,7 +273,7 @@ def smile_vol(
     past z_cap (a sensitivity knob). T <= 0 gives nu vs (the slope cap is 0 there; bs_price ignores
     the vol anyway); a NaN T gives NaN.
 
-    Slope: c = min(skew_slope(skew, m), _slope_cap(T, vs, nu, z_cap)): the monotonicity cap
+    Slope: c = min(skew_slope(skew, m, beta), _slope_cap(T, vs, nu, z_cap)): the monotonicity cap
     c_max(nu, s) of _max_slope at s = sigma0 sqrt T (a fixed point, as sigma0 depends on c) and
     Lee's root cap, so puts never fall as K rises. The cap tightens as T -> 0, so a far-OTM put at
     fixed K/F still decays to 0 at expiry; where it binds the whole smile flattens (ATM and call wing
@@ -277,11 +303,13 @@ def smile_vol(
     (2) ASSUMPTION: the call wing has half the put slope (checked later by the CLL replication's
     short calls); (3) put prices never fall as K rises (vertical spreads are arbitrage-free), on
     Lee's segment too (there d2 ~ 0 and R(0) > nu c).
+    LIMIT: the SKEW sensitivity of the slope is an assumption (skew_slope: anchored to one chain, damped by
+    beta = SKEW_BETA 0.5); beta in {0, 0.5, 1} is a sensitivity knob the case study must sweep.
     LIMIT: convexity (no butterfly arbitrage) is not enforced. The deep linear wing has negative
     density once c z is large (test_deep_linear_wing_breaks_convexity pins a case), and dP/dK drops
     where |d sigma / dK| jumps up as K rises: at Lee's far root and at a finite z_cap.
     """
-    # ponytail: first-order Gram-Charlier smile (one slope parameter, linear wings, 0.5 floor);
+    # ponytail: linear-in-z smile (one slope parameter, linear wings, 0.5 floor);
     # fit SVI per date when real option data is present (chains adapter, slice 9).
     # ponytail: one put-wing slope out to Lee's bound (the 2026-10-08 chain was linear in z to z ~ 12), so the
     # deep wing breaks convexity (LIMIT above); a Durrleman check, or a second, flatter far-wing slope, once
@@ -293,7 +321,7 @@ def smile_vol(
     if not (np.isfinite(nu) and nu > 0):
         raise ValueError(f"nu must be finite and > 0, got {nu}")
     S, K, T, vs, r, q = (np.asarray(x, dtype=float) for x in (S, K, T, vs, r, q))
-    c = np.minimum(skew_slope(skew, m), _slope_cap(T, vs, nu, z_cap))
+    c = np.minimum(skew_slope(skew, m, beta), _slope_cap(T, vs, nu, z_cap))
     s0 = vs / np.sqrt(_floored_smile_factor(c, z_cap))
     with np.errstate(all="ignore"):  # a NaN T or vs fails both tests and stays NaN; T <= 0 has c = 0, no clip
         k = np.log(K / (S * np.exp((r - q) * T)))
@@ -317,14 +345,15 @@ def quote(
     nu: float = 1.0,
     z_cap: float = Z_CAP,
     h: float = 0.05,
+    beta: float = SKEW_BETA,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """(mid, bid, ask) in index points: mid = BSM at smile_vol (m, nu, z_cap passed through),
+    """(mid, bid, ask) in index points: mid = BSM at smile_vol (m, nu, z_cap, beta passed through),
     half = max(h mid, HALF_SPREAD_MIN), bid = max(mid - half, 0), ask = mid + half.
 
     h = 0 means mid fills (half = 0, bid = ask = mid), as slice 5 replication uses. DEVIATION: the
     brief floors every half-spread at HALF_SPREAD_MIN, which would charge a tick at h = 0 too.
     """
-    mid = bs_price(S, K, T, smile_vol(S, K, T, vs, skew, r, q, m=m, nu=nu, z_cap=z_cap), r, q, cp)
+    mid = bs_price(S, K, T, smile_vol(S, K, T, vs, skew, r, q, m=m, nu=nu, z_cap=z_cap, beta=beta), r, q, cp)
     half = np.maximum(h * mid, HALF_SPREAD_MIN) if h > 0 else np.zeros_like(mid)
     return mid, np.maximum(mid - half, 0.0), mid + half
 
@@ -342,9 +371,10 @@ def strike_for_delta(
     m: float = SKEW_MULT,
     nu: float = 1.0,
     z_cap: float = Z_CAP,
+    beta: float = SKEW_BETA,
 ) -> float:
     """Scalar strike K with |bs_delta(K, smile_vol(K))| = |delta| (the sign of delta is ignored;
-    m, nu, z_cap are passed to smile_vol).
+    m, nu, z_cap, beta are passed to smile_vol).
 
     Solved with brentq on k = ln(K/F) over [-8, 1], F = S e^{(r-q)T}. A put's |delta| is at most
     e^{-qT} N(-sqrt(2 |k|)) at any vol (d1 = |k|/w + w/2 >= sqrt(2 |k|), w = sigma sqrt T), 3.2e-5 at
@@ -355,7 +385,7 @@ def strike_for_delta(
 
     def gap(k: float) -> float:
         K = F * np.exp(k)
-        vol = smile_vol(S, K, T, vs, skew, r, q, m=m, nu=nu, z_cap=z_cap)
+        vol = smile_vol(S, K, T, vs, skew, r, q, m=m, nu=nu, z_cap=z_cap, beta=beta)
         return abs(float(bs_delta(S, K, T, vol, r, q, cp))) - abs(delta)
 
     if not gap(-8.0) * gap(1.0) <= 0:  # same sign, or NaN

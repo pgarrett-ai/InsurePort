@@ -1,5 +1,5 @@
 """Pricer validation: replicate Cboe's PPUT, PPUT3M and CLL strategy indices with synthetic option
-sleeves, measure how closely they track the real index levels, and calibrate pricing.SKEW_MULT on PPUT.
+sleeves, measure how closely they track the real index levels, and show how PPUT would scale pricing.SKEW_MULT.
 
 Pure numpy/pandas + sleeves.py, no I/O. Each replica is sleeves.option_sleeve in overlay mode
 (coverage 1: one option per unit of index) holding the S&P 500 total-return index, rolled on
@@ -34,6 +34,8 @@ Known error sources, disclosed rather than modelled:
   validate) and holds a likely bad put mark on 2020-02-28 / 2020-03-02 (BAD_MARKS, flagged).
 Index levels before LAUNCH are Cboe back-tests, not live index values.
 """
+
+from collections.abc import Sequence
 
 import numpy as np
 import pandas as pd
@@ -71,6 +73,7 @@ TOLERANCE = {
 }
 WINDOWS = {"PPUT": ("2016-01-01", None), "PPUT3M": ("2016-01-01", None), "CLL": ("2008-08-26", None)}  # OOS
 TRAIN_END = "2015-12-31"
+M_GRID = (0.5, 0.75, 1.0, 1.25, 1.5)  # calibrate_skew's default: scales on the anchored slope around SKEW_MULT 1
 LAUNCH = {"PPUT": "2015-08-03", "CLL": "2008-09-04", "PPUT3M": "2021-08-02"}  # earlier levels are Cboe back-tests
 SPLICES = {"CLL": "2009-10-16"}  # Cboe file breaks: the level steps with no market move behind it
 BAD_MARKS = {"CLL": ("2020-02-28", "2020-03-02")}  # likely bad put marks (CLL and CLL3M alike): flagged, kept
@@ -114,12 +117,13 @@ def replicate(
     nu: float = 1.0,
     h: float = 0.0,
     z_cap: float = pricing.Z_CAP,
+    beta: float = pricing.SKEW_BETA,
 ) -> pd.Series:
     """Synthetic level of index `which` on mkt.index, scaled to equal the real index (column
     which.lower()) on the first date where both exist; NaN before the replica starts.
 
     The replica is sleeves.option_sleeve(SPECS[conventions][which]) with its default underlying
-    (spxtr) and m, nu, h, z_cap passed on, on mkt with its term structure filled
+    (spxtr) and m, nu, h, z_cap, beta passed on, on mkt with its term structure filled
     (pricing.fill_term_structure, unless mkt has ts_filled); fill "cboe" then charges _fill_cost
     (no-op after 2015), "mid" does not. conventions "cboe" needs spx_open values in mkt. PPUT starts
     on mkt's first row (unhedged until its first roll). PPUT3M and CLL must buy their quarterly put
@@ -132,7 +136,7 @@ def replicate(
         raise ValueError(f"need conventions in {list(SPECS)} and fill 'cboe' or 'mid', got {conventions!r}, {fill!r}")
     if which not in SPECS[conventions]:
         raise ValueError(f"unknown target {which!r}; expected one of {list(SPECS[conventions])}")
-    col, kw = which.lower(), {"m": m, "nu": nu, "h": h, "z_cap": z_cap}
+    col, kw = which.lower(), {"m": m, "nu": nu, "h": h, "z_cap": z_cap, "beta": beta}
     if col not in mkt:
         raise ValueError(f"mkt has no {col!r} column to scale the {which} replica to")
     panel = mkt if "ts_filled" in mkt else pricing.fill_term_structure(mkt)
@@ -222,6 +226,7 @@ def validate(
     z_cap: float = pricing.Z_CAP,
     windows: dict[str, tuple[str, str | None]] = WINDOWS,
     pput3m: pd.Series | None = None,
+    beta: float = pricing.SKEW_BETA,
 ) -> pd.DataFrame:
     """The validation table: one row per target in `windows` (target -> (start, end), end None =
     open), indexed by target.
@@ -232,12 +237,12 @@ def validate(
     and dropped first (as in tracking), so the window dates are real prints. A SPLICES date in the
     panel is neutralised: the real levels before it are rescaled so that its return (from the last
     real print before it) equals the replica's. Each replica runs on the whole panel (conventions,
-    fill, m, nu, h, z_cap passed on) and is cut to the window, starting from the last common date
+    fill, m, nu, h, z_cap, beta passed on) and is cut to the window, starting from the last common date
     before `start` so the window's first full month counts; tracking() on the daily levels with
     _roll_days() and the target's BAD_MARKS inside the window.
     Columns: window_start / window_end (first / last common date used), te, dcagr, corr, dmaxdd,
     n_months, te_roll, te_nonroll, te_ex_bad, bad_marks (those dates, "YYYY-MM-DD, ..."; "" if none),
-    the run's conventions, fill and z_cap, then te_ok (te <= TOLERANCE te), dcagr_ok (|dcagr| <=
+    the run's conventions, fill, z_cap and beta, then te_ok (te <= TOLERANCE te), dcagr_ok (|dcagr| <=
     TOLERANCE dcagr), corr_ok (corr >= TOLERANCE corr) and passed (all three; on te, bad marks in).
     Raises ValueError when a window holds fewer than 3 common month-ends (no tracking error to measure).
     """
@@ -248,7 +253,7 @@ def validate(
         col = which.lower()
         if col not in mkt:
             continue
-        synth = replicate(mkt, which, conventions=conventions, fill=fill, m=m, nu=nu, h=h, z_cap=z_cap)
+        synth = replicate(mkt, which, conventions=conventions, fill=fill, m=m, nu=nu, h=h, z_cap=z_cap, beta=beta)
         actual = mkt[col].where(mkt[col].diff().ne(0))  # stale prints out before the window is cut (see tracking)
         if which in SPLICES and (d := pd.Timestamp(SPLICES[which])) in actual.index[1:]:
             p = actual[:d].iloc[:-1].last_valid_index()  # the last real print before the splice
@@ -264,7 +269,7 @@ def validate(
         ok = {"te_ok": t["te"] <= tol["te"], "dcagr_ok": abs(t["dcagr"]) <= tol["dcagr"],
               "corr_ok": t["corr"] >= tol["corr"]}
         run = {"bad_marks": ", ".join(f"{d:%Y-%m-%d}" for d in bad), "conventions": conventions, "fill": fill,
-               "z_cap": z_cap}
+               "z_cap": z_cap, "beta": beta}
         rows[which] = {"window_start": lv.index[0], "window_end": lv.index[-1], **t, **run, **ok,
                        "passed": all(ok.values())}
     return pd.DataFrame.from_dict(rows, orient="index")
@@ -272,30 +277,27 @@ def validate(
 
 def calibrate_skew(
     mkt: pd.DataFrame,
-    m_grid: np.ndarray = np.round(np.arange(0.05, 1.01, 0.05), 2),
+    m_grid: Sequence[float] = M_GRID,
     train_end: str = TRAIN_END,
     h: float = 0.0,
 ) -> pd.DataFrame:
-    """PPUT replication (replicate's defaults: Cboe conventions and fill) on mkt up to train_end for each m of
-    m_grid, indexed by m.
+    """PPUT replication (replicate's defaults: Cboe conventions and fill, pricing.SKEW_BETA) on mkt up to train_end
+    for each m of m_grid, a scale on the anchored slope (pricing.skew_slope), indexed by m. Informational:
+    SKEW_MULT stays 1, the slope of the observed chain; the grid shows how far PPUT's level would pull it.
 
     The panel is cut at train_end before anything runs (the term-structure back-fill included),
     so nothing later leaks in. Columns: te, dcagr, corr (tracking over the whole training panel),
-    cap_share (share of training days with SKEW and VIX whose m gamma / 6 is above the pricer's
+    cap_share (share of training days with SKEW and VIX whose skew_slope(SKEW, m) is above the pricer's
     slope cap for a 30-day option at that day's VIX, pricing._slope_cap at nu 1 and Z_CAP, where m
-    stops moving prices: the m objective is identified by the other days; the cap tightens as T
-    falls, so later in each PPUT month it binds more often) and best: the m with the smallest
-    |dcagr| on the training panel, ties to the lower te.
-    Why match CAGR rather than minimise te: m sets the premium level, which te (a demeaned std)
-    barely sees. On PPUT 1990-2015 (Cboe conventions and fill) te falls only 0.30 pp across
-    m 0.2..1.0 (2.10% to 1.80%) while dcagr falls 2.9 pp (-0.49% to -3.38%/yr), so te alone picks
-    the grid edge m 1 with a price level seven times outside the CAGR tolerance. The first rule
-    tried (lowest te subject to |dcagr| <= tolerance) is biased to the edge of the tolerance band
-    because te is monotone in m: it chose m 0.2 using 0.49 of the 0.50 pp budget, and the
-    out-of-sample dcagr then landed on the boundary (-0.502%). The tool's objective is CAGR, so the
-    rule now matches the training-period CAGR directly and reports te alongside; both results are
-    disclosed in METHODOLOGY. The 1990-2015 fill add-on lowers the replica's CAGR, so it pulls the
-    chosen m down.
+    stops moving prices; the cap tightens as T falls, so later in each PPUT month it binds more often)
+    and best: the m with the smallest |dcagr| on the training panel, ties to the lower te.
+    Why CAGR rather than te: m sets the premium level, which te (a demeaned std) barely sees. Under the
+    old slope c = m gamma / 6 on PPUT 1990-2015 te fell only 0.30 pp across m 0.2..1.0 while dcagr fell
+    2.9 pp, so te alone picked the grid edge; and fitting |dcagr| moved m from 0.2 to 0.05 with fill and
+    settlement conventions closing data cannot identify, which is why m is no longer fitted. On the
+    anchored slope too te barely moves across the grid while dcagr moves a lot, and PPUT's level would
+    pull m to the grid's low edge (scripts/calibrate.py prints the live grid). The 1990-2015 fill add-on
+    lowers the replica's CAGR, so it pulls the best m down.
     """
     train = mkt.loc[:train_end]
     days = train[["skew", "vix"]].dropna()

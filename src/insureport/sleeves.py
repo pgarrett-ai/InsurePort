@@ -201,11 +201,11 @@ def _settle_row(day: np.ndarray, expiry: np.ndarray) -> np.ndarray:
 
 def _quotes(
     px: dict[str, np.ndarray], day: np.ndarray, K: np.ndarray, expiry: np.ndarray, call: np.ndarray,
-    *, m: float, nu: float, h: float, z_cap: float, chain: pd.DataFrame | None = None,
+    *, m: float, nu: float, h: float, z_cap: float, beta: float, chain: pd.DataFrame | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """(mid, bid, ask, fallback) in index points, elementwise: option (K, expiry, call) on panel row `day`.
 
-    The model branch: pricing.quote (m, nu, h, z_cap passed on) at the row's S, T = (expiry -
+    The model branch: pricing.quote (m, nu, h, z_cap, beta passed on) at the row's S, T = (expiry -
     date)/365 and the vols, skew, r, q of the last usable row (_inputs `eff`: the row itself
     unless its inputs are unusable), vs = var_swap_vol(T, VIX pillars). From the settle row
     (_settle_row) on, T = 0: the mid is the intrinsic value at the settle row's px["settle"] (its
@@ -229,7 +229,7 @@ def _quotes(
             r = row[sel]
             out[:, sel] = pricing.quote(
                 S[sel], K[sel], T[sel], vs[sel], px["skew"][r], px["r"][r], px["q"][r], cp,
-                m=m, nu=nu, h=h, z_cap=z_cap,
+                m=m, nu=nu, h=h, z_cap=z_cap, beta=beta,
             )
     if chain is None:
         return out[0], out[1], out[2], px["stale"][day]
@@ -242,7 +242,7 @@ def _quotes(
 
 def _open_legs(
     px: dict[str, np.ndarray], opens: list[tuple[int, Leg, int]], offset: int, *, m: float, nu: float, h: float,
-    z_cap: float, chain: pd.DataFrame | None = None,
+    z_cap: float, beta: float, chain: pd.DataFrame | None = None,
 ) -> list[dict]:
     """New legs from (open row, Leg, scheduled close row; len(panel) = past the data).
 
@@ -287,7 +287,7 @@ def _open_legs(
             T = (expiry - day[t]).astype(float) / 365
             vs = float(pricing.var_swap_vol(T, *(px[c][row] for c in _VOLS)))
             args = (S, T, vs, px["skew"][row], px["r"][row], px["q"][row])
-            K = pricing.strike_for_delta(*args, L.delta, L.cp, m=m, nu=nu, z_cap=z_cap)
+            K = pricing.strike_for_delta(*args, L.delta, L.cp, m=m, nu=nu, z_cap=z_cap, beta=beta)
         K, source = _snap(K, L.strike_rule, L.grid), "model"
         # ponytail: one root, SPX monthlies (AM-settled); SPXW weeklies / PM dailies in a chain are ignored. Give
         # Leg a root if a strategy needs weeklies (then settle those at the close)
@@ -305,7 +305,7 @@ def _open_legs(
     call = np.repeat([g["leg"].cp == "C" for g in legs], lens)
     cuts = np.cumsum(lens)[:-1]
     quotes = (np.split(a, cuts) for a in _quotes(px, day, K, expiry, call, m=m, nu=nu, h=h, z_cap=z_cap,
-                                                 chain=chain))
+                                                 beta=beta, chain=chain))
     for g, mid, bid, ask, fb in zip(legs, *quotes):
         g["mid"], g["bid"], g["ask"], g["fb"] = mid, bid, ask, fb
         g["unit_cost"] = float(ask[0] if g["leg"].qty > 0 else bid[0])
@@ -335,6 +335,7 @@ def option_sleeve(
     chain: pd.DataFrame | None = None,
     anchors: pd.DatetimeIndex | None = None,
     carry: pd.Series | None = None,
+    beta: float = pricing.SKEW_BETA,
 ) -> pd.DataFrame:
     """Daily returns of a rolled synthetic-SPX-option sleeve, per unit of sleeve capital.
 
@@ -355,7 +356,7 @@ def option_sleeve(
     State: cash C (grows by 1 + rf_{t-1} days/360, or by 1 + `carry`, daily returns on mkt's dates (NaN
     0), when given: the TAIL proxy's cash is a Treasury), stock A (overlay; grows with `underlying`,
     default spxtr.pct_change()), legs n_j (signed index units). NAV = A + C + sum n_j mid_j.
-    Quotes from pricing.quote via _quotes (m, nu, h, z_cap passed on; m, nu, z_cap also to
+    Quotes from pricing.quote via _quotes (m, nu, h, z_cap, beta passed on; m, nu, z_cap, beta also to
     strike_for_delta): marks at mid; opens at the ask (long) / bid (short); closes before expiry
     at the bid (long) / ask (short); from the last trading day on or before expiry the leg is
     worth intrinsic on that day's close (spec.settle "close") or open ("open": spx_open, the
@@ -432,7 +433,8 @@ def option_sleeve(
         raise ValueError("the spec settles or strikes at the open: mkt needs spx_open values")
     if "ts_filled" not in mkt:
         mkt = pricing.fill_term_structure(mkt)
-    px, n, kw = _inputs(mkt, spec.settle), len(mkt), {"m": m, "nu": nu, "h": h, "z_cap": z_cap, "chain": chain}
+    px, n, kw = _inputs(mkt, spec.settle), len(mkt), {"m": m, "nu": nu, "h": h, "z_cap": z_cap, "beta": beta,
+                                                       "chain": chain}
     premium = spec.mode == "premium"
     ev = mkt.index.get_indexer(roll_dates(mkt.index, spec.roll_every_months, offset_bdays, spec.roll_when))
     ev = ev[px["eff"][ev] >= 0].tolist()
@@ -482,9 +484,9 @@ def option_sleeve(
             # ponytail: ret is a double. Under a flat or near-flat put wing a far-OTM put held to expiry at f ~ 1
             # marks below 1e-16 of the day before in the last ~4 trading days at VIX <= 15, ret rounds to -1, and a
             # gain or crash payoff in expiry week is lost to compounding (test_expiry_week_payoff_is_lost_to_return_
-            # rounding). The default linear wing (m = SKEW_MULT 0.2) keeps such marks alive at SKEW >~ 107; a finite
-            # z_cap or a near-flat smile (SKEW <~ 106, as in 1996-97) still rounds ret to -1. Add a NAV column (or
-            # have the engine read sleeve NAV levels) if hold-to-expiry premium presets are used.
+            # rounding). The default linear wing (the anchored slope) keeps such marks alive at VIX 12 for SKEW >=
+            # 100.5; a finite z_cap or a flat smile still rounds ret to -1. Add a NAV column (or have the engine read
+            # sleeve NAV levels) if hold-to-expiry premium presets are used.
             with np.errstate(divide="ignore", invalid="ignore"):
                 base = np.r_[nav, navs[:-1]]
                 ret[days] = np.where(base > 0, navs / base - 1, 0.0)  # no capital, no return

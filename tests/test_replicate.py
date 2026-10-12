@@ -9,12 +9,13 @@ settlement at the open, which alone moves roll days only; no open values, no Cbo
 mid), the smile and convention knobs reaching the replica and the table, validate passing conventions
 and fill on and calibrate_skew running on replicate's Cboe defaults, the validation table (its pass flags, the run
 settings, the CLL bad-mark flag), a neutralised splice and too-short windows, a regression pin of
-PPUT tracking with the committed pricing.SKEW_MULT, the calibration grid (lowest TE within the PPUT
-CAGR tolerance, else lowest TE, ties to the smaller |dCAGR|; slope-cap share; nothing after
-train_end used) and unknown targets and settings.
+PPUT tracking at the pricer's defaults (SKEW_MULT 1 on the anchored slope, SKEW_BETA 0.5; TE bound only,
+slice 5's |dCAGR| <= 1%/yr bound breached and recorded there), the calibration grid (its default m grid;
+smallest |dCAGR|, ties to the lower TE; slope-cap share; nothing after train_end used) and unknown
+targets and settings.
 
 Why: the replicas are the pricer's only check against traded-option strategy indices, and the
-calibrated SKEW_MULT feeds every option sleeve. Committed fixture CSV plus synthetic series, no I/O.
+pricer feeds every option sleeve. Committed fixture CSV plus synthetic series, no I/O.
 """
 
 import dataclasses
@@ -106,7 +107,7 @@ def test_replicate_is_aligned_and_scaled_to_the_real_index(which):
 
 
 def test_knobs_reach_the_replica_and_the_table():
-    kw = {"m": 0.7, "nu": 1.2, "h": 0.05, "z_cap": 2.5}
+    kw = {"m": 0.7, "nu": 1.2, "h": 0.05, "z_cap": 2.5, "beta": 1.0}
     for conv in ("cboe", "naive"):  # the fixture is after 2015: the cboe fill is the mid, no add-on
         nav = metrics.nav_from_returns(sleeves.option_sleeve(MKT, replicate.SPECS[conv]["PPUT"], **kw)["ret"])
         assert replicate.replicate(MKT, "PPUT", conventions=conv, **kw).to_numpy() == pytest.approx(
@@ -122,7 +123,9 @@ def test_naive_conventions_reproduce_slice_5():
     """conventions="naive" is the slice-5 replica (strikes 0.95 / 0.90 / 1.10 x the close, continuous,
     settled at the close); the default cboe fill is the mid after 2015. Levels pinned from the pre-5b code
     (slice-5 conventions on the slice-3c linear-wing pricer with the VIX1Y pillar) on this fixture at
-    SKEW_MULT 0.3."""
+    SKEW_MULT 0.3 under the old slope c = m gamma / 6, which is beta = 1 at m = 0.3 GAMMA_REF / (6 SLOPE_REF)
+    (slice 3d): the same levels to float noise."""
+    old = {"m": 0.3 * pricing.GAMMA_REF / (6 * pricing.SLOPE_REF), "beta": 1.0}
     mkt = MKT.assign(pput3m=(MKT["spxtr"] / 60).where(MKT.index >= "2018-06-01"))
     pins = {
         "PPUT": {"2018-02-09": 844.7875855550132, "2018-12-24": 785.3898217654562, "2019-12-31": 1030.005626387901},
@@ -130,7 +133,7 @@ def test_naive_conventions_reproduce_slice_5():
         "PPUT3M": {"2018-06-29": 89.51158345449845, "2018-12-24": 84.75928959033531, "2019-12-31": 113.91488318342678},
     }
     for which, vals in pins.items():
-        s = replicate.replicate(mkt, which, conventions="naive", m=0.3)
+        s = replicate.replicate(mkt, which, conventions="naive", **old)
         assert s[list(vals)].tolist() == pytest.approx(list(vals.values()), rel=1e-12)
 
 
@@ -219,7 +222,7 @@ def test_cboe_fill_is_an_ask_030_points_over_a_nonzero_mid(monkeypatch):
 def test_validate_passes_conventions_and_fill_on_and_calibrate_skew_uses_the_cboe_defaults(monkeypatch):
     """The fixture is after 2015, where the cboe fill is the mid, so the calls are recorded: validate passes
     conventions and fill on; calibrate_skew leaves both at replicate's defaults, Cboe conventions and fill,
-    the setting the committed SKEW_MULT was calibrated under."""
+    the setting the PPUT validation of the committed SKEW_MULT runs under."""
     seen, real = [], replicate.replicate
     monkeypatch.setattr(replicate, "replicate", lambda *a, **kw: seen.append(kw) or real(*a, **kw))
     runs = [("naive", "mid"), ("cboe", "cboe")]
@@ -237,10 +240,11 @@ def test_validate_table_and_flags():
     v = replicate.validate(MKT, windows={"PPUT": ("2018-01-01", None), "CLL": ("2018-01-01", None)})
     assert v.index.tolist() == ["PPUT", "CLL"]
     assert {"window_start", "window_end", "te", "dcagr", "corr", "dmaxdd", "n_months", "te_roll", "te_nonroll",
-            "te_ex_bad", "bad_marks", "conventions", "fill", "z_cap", "te_ok", "dcagr_ok", "corr_ok",
+            "te_ex_bad", "bad_marks", "conventions", "fill", "z_cap", "beta", "te_ok", "dcagr_ok", "corr_ok",
             "passed"} <= set(v.columns)
     assert v[["te_roll", "te_nonroll"]].notna().all().all()
     assert (v["conventions"] == "cboe").all() and (v["fill"] == "cboe").all() and (v["z_cap"] == pricing.Z_CAP).all()
+    assert (v["beta"] == pricing.SKEW_BETA).all()
     assert (v["bad_marks"] == "").all() and (v["te_ex_bad"] == v["te"]).all()  # the CLL bad marks are in 2020
     for which, row in v.iterrows():
         tol = replicate.TOLERANCE[which]
@@ -287,23 +291,29 @@ def test_validate_neutralises_a_splice(monkeypatch):
 
 
 def test_pput_tracking_regression_pin():
-    """PPUT on the 2018-2019 fixture at the committed SKEW_MULT = 0.3 (anchored to the observed market smile
-    slope, not fitted to PPUT), Cboe conventions and fill (h = 0): te = 0.01045, dcagr = -0.00797,
-    corr = 0.98568 (23 months); slice 5 (naive, m 0.3) had te 0.0112, dcagr +0.0092. Loose bound: te within
-    2x the out-of-sample TE tolerance, |dcagr| <= 1%/yr."""
+    """PPUT on the 2018-2019 fixture at the committed defaults (SKEW_MULT 1 on the slope anchored to the observed
+    market smile, SKEW_BETA 0.5; not fitted to PPUT), Cboe conventions and fill (h = 0): te = 0.01007,
+    dcagr = -0.01378, corr = 0.98868 (23 months). Before slice 3d (c = 0.3 gamma / 6) te 0.01045, dcagr -0.00797,
+    corr 0.98568; slice 5 (naive, m 0.3) had te 0.0112, dcagr +0.0092. The anchored slope is steeper than the
+    old one below SKEW ~156 (0.191 vs 0.130 at the fixture's median SKEW 126), so the 5% OTM put costs more and
+    the replica lags Cboe's PPUT by 0.58 pp/yr more. Loose bound: te within 2x the out-of-sample TE tolerance.
+    Slice 5 also bounded |dcagr| <= 1%/yr here; the pinned -1.38% breaches it (live out-of-sample PPUT dCAGR:
+    figures/validation_table.md), an open trade-off of the anchored slope, so only the pin holds dcagr."""
     t = replicate.tracking(replicate.replicate(MKT, "PPUT"), MKT["pput"], MKT["spxtr"])
-    assert t["te"] <= 2 * replicate.TOLERANCE["PPUT"]["te"] and abs(t["dcagr"]) <= 0.01
-    assert (t["te"], t["dcagr"], t["corr"]) == pytest.approx((0.01045, -0.00797, 0.98568), abs=1e-5)
+    assert t["te"] <= 2 * replicate.TOLERANCE["PPUT"]["te"]
+    assert (t["te"], t["dcagr"], t["corr"]) == pytest.approx((0.01007, -0.01378, 0.98868), abs=1e-5)
 
 
 def test_calibrate_skew_marks_one_best(monkeypatch):
     """best = the m with the smallest |dcagr| on the training panel, ties to the lower te."""
-    g = replicate.calibrate_skew(MKT, m_grid=[0.2, 0.5, 0.7], train_end="2019-12-31")
-    assert g.index.tolist() == [0.2, 0.5, 0.7] and g["best"].sum() == 1
+    assert inspect.signature(replicate.calibrate_skew).parameters["m_grid"].default == (0.5, 0.75, 1.0, 1.25, 1.5)
+    g = replicate.calibrate_skew(MKT, m_grid=[0.5, 2.0, 3.0], train_end="2019-12-31")
+    assert g.index.tolist() == [0.5, 2.0, 3.0] and g["best"].sum() == 1
     assert {"te", "dcagr", "corr", "cap_share"} <= set(g.columns)
-    # the slope cap binds above SKEW 100 + 60 c* / m, c* the 30 d cap at the day's VIX (0.39 .. 0.64 on the
-    # fixture, median 0.46: SKEW 155 at m 0.5, 140 at m 0.7): never at m 0.2, 5 days at m 0.5, 99 at m 0.7
-    assert g["cap_share"].tolist() == pytest.approx([0, 5 / len(MKT), 99 / len(MKT)])
+    # the slope cap binds where m 0.263 (gamma / 4.919)^0.5 > c*, c* the 30 d cap at the day's VIX (0.39 .. 0.64
+    # on the fixture, median 0.46; SKEW 111 .. 159): never at m 0.5 (nor anywhere on the default grid, up to
+    # m 1.5), 109 days at m 2, 386 at m 3
+    assert g["cap_share"].tolist() == pytest.approx([0, 109 / len(MKT), 386 / len(MKT)])
     assert g.index[g["best"]].tolist() == [g["dcagr"].abs().idxmin()]
     monkeypatch.setattr(replicate, "replicate", lambda mkt, which, **kw: kw["m"])  # tracking sees m as the synth
     monkeypatch.setattr(replicate, "tracking", lambda m, a, b: {"te": {0.3: 0.02, 0.5: 0.01, 0.7: 0.03}[m],

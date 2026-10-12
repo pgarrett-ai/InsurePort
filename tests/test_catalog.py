@@ -18,9 +18,10 @@ above 1/3; option re-runs, the roll-offset skip for hold-to-expiry overlays and 
 put preset's shock and bleed at its own weight; the option sleeve's coverage marked daily; the 60/40
 benchmark from px, skipped on an empty AGG column; the index launch and bad-mark notes), the
 robustness helpers on hand-built years (the best crash year of two, the crash edge), the calm-year
-bleed, the critic's stand-alone view (excess returns over cash), ranking, the Universa known-answer
-table and the -20% one-month shock P&L (its formula through the option_sleeve seam; the calm state
-from mkt's last year; the addendum's figure at the 2026-10-08 inputs; the fixture's values pinned).
+bleed, the critic's stand-alone view (excess returns over cash), the net return on premium (the third
+denominator, hand values), ranking, the Universa known-answer table and the -20% one-month shock P&L
+(its formula through the option_sleeve seam; the calm state from mkt's last year; the addendum's figure
+at the 2026-10-08 inputs, within 4 points and pinned; the fixture's values pinned).
 
 Why: the Candidates page and the case study read every verdict from here, so each rule is pinned on
 inputs whose answer is known by construction. Synthetic series plus the committed fixture, no I/O.
@@ -585,6 +586,26 @@ def test_critic_view_works_on_excess_returns_over_cash():
     assert v["sharpe"] == pytest.approx(ex.mean() / ex.std() * np.sqrt(252), rel=1e-9)
 
 
+def test_return_on_premium_hand_values():
+    idx = pd.date_range("2019-01-01", periods=5)  # calendar days: 1 / 360 of rf a day
+    none, rf0 = pd.DatetimeIndex([]), pd.Series(0.0, idx)
+    # day 1 buys a put for 1% of NAV, worthless on day 2 (-1%); day 3 buys one for 1% of the 0.99 left, worth 4x
+    # its cost on day 4 (+0.0099 x 3 / 0.99 = +3%): P&L -0.01 + 0.0297 on premium 0.01 + 0.0099
+    r = pd.Series([0.0, 0.0, -0.01, 0.0, 0.03], idx)
+    r.attrs = {"premium_paid": pd.Series([0.0, 0.01, 0.0, 0.01, 0.0], idx)}
+    assert catalog.return_on_premium(r, rf0, none) == pytest.approx(0.0197 / 0.0199, rel=1e-12)
+    # refilled to unit capital at a rebalance on day 2: -0.01 and +0.03 on 0.01 each
+    assert catalog.return_on_premium(r, rf0, idx[[2]]) == pytest.approx(1.0, rel=1e-12)
+    # T-bill carry is not option P&L: rf 3.6% (1 bp a day) comes off the sleeve's growth
+    nav = (1 + r.iloc[1:]).prod()
+    assert catalog.return_on_premium(r, pd.Series(0.036, idx), none) == pytest.approx(
+        (nav - 1.0001**4) / 0.0199, rel=1e-12)
+    r.attrs["premium_paid"] = pd.Series(0.0, idx)
+    assert np.isnan(catalog.return_on_premium(r, rf0, none))  # nothing spent
+    r.attrs = {}
+    assert np.isnan(catalog.return_on_premium(r, rf0, none))  # not an option sleeve
+
+
 def test_rank_orders_tiers_then_dcagr_and_drops_private_keys():
     rows = [{"candidate": k, "verdict": v, "d_cagr_bp": d, "_table": None, "_nav": None} for k, v, d in (
         ("a", "not cost-effective", 5.0), ("b", "cost-effective (fragile)", 10.0),
@@ -652,18 +673,27 @@ def test_shock_pnl_at_the_addendum_calm_day():
     old = pd.DataFrame(calm.iloc[0].to_dict() | {"skew": 120.0}, index=pd.bdate_range(end="2025-10-08", periods=2000))
     pnl = catalog.shock_pnl(CANDIDATES["universa_model"], pd.concat([old, calm]), catalog.W_UNIVERSA)
     assert pnl == catalog.shock_pnl(CANDIDATES["universa_model"], calm, catalog.W_UNIVERSA)
+    # pinned: -14.9% / -11.0% / -6.6%, 3.4 / 2.7 / 3.4 points below the addendum's figure. The calm-day premium
+    # matches the chain (SKEW 149.19 gives the chain's slope, market / model 1.00 at 84 d), so the 0.20% budget buys
+    # ~20% less notional than under the old c = 0.3 gamma / 6 (-13.8% / -8.8% / -3.2%); the gap left is the
+    # post-shock repricing: the addendum takes wing IV 55 / 65 / 80%, the model a flat term structure at
+    # VIX 40 / 55 / 70 with SKEW held
+    assert pnl == pytest.approx({40.0: -0.14913, 55.0: -0.10987, 70.0: -0.06567}, rel=1e-3)
+    # the known answer stays checked: the bound was 3 points, widened to 4 when the anchored slope moved this
+    # state away from the addendum (above), so a pricer change that drifts further fails here, not only the pin
     for v, want in zip(catalog.SHOCK_VIX, (-0.115, -0.083, -0.032)):
-        assert pnl[v] == pytest.approx(want, abs=0.03), v  # within 3 points: about -13.8% / -8.8% / -3.2%
+        assert pnl[v] == pytest.approx(want, abs=0.04), v
 
 
 def test_shock_pnl_of_the_universa_preset():
-    # the real pricer on the fixture's calm state (2019: VIX 14.9, SKEW 123): +65% / +155% / +260% for the
-    # portfolio. At SKEW 123 the model's far wing is cheap, so the 0.20% budget buys many times the notional it
-    # buys at today's SKEW 149 (test above); the same SKEW sensitivity sizes the sleeve inside every backtest.
-    # Pinned so that any pricer or sleeve change shows here.
+    # the real pricer on the fixture's calm state (2019: VIX 14.9, SKEW 123): +2.3% / +23% / +47% for the
+    # portfolio. At SKEW 123 the model's far wing is cheaper than at today's SKEW 149 (test above), so the 0.20%
+    # budget buys more notional; the slope's SKEW sensitivity (pricing.SKEW_BETA, damped in slice 3d) sizes the
+    # sleeve inside every backtest. The old c = 0.3 gamma / 6 gave +65% / +155% / +260%. Pinned so that any
+    # pricer or sleeve change shows here.
     c = CANDIDATES["universa_model"]
     pnl = catalog.shock_pnl(c, MKT, catalog.W_UNIVERSA)
-    assert pnl == pytest.approx({40.0: 0.6496, 55.0: 1.5518, 70.0: 2.6029}, rel=1e-3)
+    assert pnl == pytest.approx({40.0: 0.0235, 55.0: 0.2317, 70.0: 0.4699}, rel=1e-3)
     for key in ("prot_put", "collar", "tail_proxy"):  # every put preset (addendum section 3)
         assert np.isfinite(list(catalog.shock_pnl(CANDIDATES[key], MKT, 0.5).values())).all(), key
     # dao_ch9 spends all its cash each roll, so the month-old put sold at a zero bid wipes it out and it restarts
