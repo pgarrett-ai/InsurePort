@@ -161,6 +161,19 @@ def replicate(
     return (nav * (actual[first] / nav[first])).rename(f"{col}_synth")
 
 
+def unsplice(actual: pd.Series, synth: pd.Series, which: str) -> pd.Series:
+    """actual (the real levels of `which`) with Cboe's file break at SPLICES[which] neutralised: the levels from
+    the splice date on divided by k = (actual return) / (synth return) over (the last real print before it,
+    the splice date], so that day's return equals the replica's and the levels before it stay as they are (a
+    chart keeps the replica and the index starting together). actual unchanged when `which` has no splice, the
+    date is not after actual's first row, or either series lacks a level on those two days."""
+    if which not in SPLICES or (d := pd.Timestamp(SPLICES[which])) not in actual.index[1:]:
+        return actual
+    p = actual[:d].iloc[:-1].last_valid_index()  # the last real print before the splice
+    k = (actual[d] / actual[p]) / (synth[d] / synth[p])
+    return actual if np.isnan(k) else actual.where(actual.index < d, actual / k)
+
+
 def tracking(
     synth: pd.Series,
     actual: pd.Series,
@@ -235,8 +248,8 @@ def validate(
     forward fill: filled rows would be stale prints, dropped anyway); a target whose real series is
     not in the panel (PPUT3M without pput3m) gets no row. Real levels equal to the one before are stale prints
     and dropped first (as in tracking), so the window dates are real prints. A SPLICES date in the
-    panel is neutralised: the real levels before it are rescaled so that its return (from the last
-    real print before it) equals the replica's. Each replica runs on the whole panel (conventions,
+    panel is neutralised (unsplice): the real levels from it on are rescaled so that its return (from the
+    last real print before it) equals the replica's. Each replica runs on the whole panel (conventions,
     fill, m, nu, h, z_cap, beta passed on) and is cut to the window, starting from the last common date
     before `start` so the window's first full month counts; tracking() on the daily levels with
     _roll_days() and the target's BAD_MARKS inside the window.
@@ -255,10 +268,8 @@ def validate(
             continue
         synth = replicate(mkt, which, conventions=conventions, fill=fill, m=m, nu=nu, h=h, z_cap=z_cap, beta=beta)
         actual = mkt[col].where(mkt[col].diff().ne(0))  # stale prints out before the window is cut (see tracking)
-        if which in SPLICES and (d := pd.Timestamp(SPLICES[which])) in actual.index[1:]:
-            p = actual[:d].iloc[:-1].last_valid_index()  # the last real print before the splice
-            actual = actual.where(actual.index >= d, actual * (actual[d] / actual[p]) / (synth[d] / synth[p]))
-        lv = pd.concat([synth, actual, mkt["spxtr"]], axis=1).dropna().loc[:end]
+        actual = unsplice(actual, synth, which)
+        lv =pd.concat([synth, actual, mkt["spxtr"]], axis=1).dropna().loc[:end]
         lv = lv.iloc[max(lv.index.searchsorted(pd.Timestamp(start)) - 1, 0) :]
         if lv.index.to_period("M").nunique() < 3:
             raise ValueError(f"{which}: window {start}..{end} has fewer than 3 common month-ends")

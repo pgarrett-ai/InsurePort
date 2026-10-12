@@ -1,7 +1,8 @@
 """Tests for insureport.scenarios: the book's regime bins (right-closed edges) and the regime table,
 the cartoon haven tables (insurance X = (1 - p)/p, store of value CPI + 2% real or the book's 7%),
 book-mode and estimated-mode portfolio returns per regime (full calendar years only, empty regimes
-NaN), geometric vs arithmetic dice growth (and ruin), the Kelly allocation (closed form, the w_max
+NaN), the implied haven (the inverse of the mix; on engine NAVs it refills after a wipe-out), geometric
+vs arithmetic dice growth (and ruin), the Kelly allocation (closed form, the w_max
 cap, the feasibility bound), cost-effectiveness, the breakeven crash frequency and the
 crash-frequency sweep (one and two crash regimes, a window with no crash year, invalid crash sets),
 the book-style annual bootstrap (joint / reshuffle / no-crash, annual vs no rebalancing, paired
@@ -21,6 +22,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from insureport import backtest, metrics
 from insureport import scenarios as sc
 
 # Safe Haven (2021) ch. 2-3 die, faces 1..6, each 1/6 ("Kelly optimal bet size", idx pp. 81-87)
@@ -209,6 +211,20 @@ def test_regime_portfolio_returns_estimated_mode():
     assert sc.regime_portfolio_returns(late, _years([0.1, 0.2], 2010))[2].sum() == 2
     with pytest.raises(ValueError, match="full calendar year"):
         sc.regime_portfolio_returns(nav.loc[:"2010-06-30"], spx)
+
+
+def test_implied_haven_inverts_the_mix_and_refills_after_a_wipe_out():
+    P = sc.book_portfolio_returns(CORE2, INS2, 0.05)[:, 0]
+    np.testing.assert_allclose(sc.implied_haven(CORE2, P, 0.05), INS2, rtol=1e-12)
+    # engine NAVs at w 0 / 0.1 rebalanced at each year-end, tc 0: the haven loses 100% in 2019, then gains 50% in
+    # 2020 on the refilled sleeve (compounding the sleeve alone would stay at 0 and make 2020 0 / 0)
+    idx = pd.to_datetime(["2018-12-31", "2019-06-28", "2019-12-31", "2020-06-30", "2020-12-31"])
+    core = pd.Series([0.0, 0.05, 0.05, -0.1, 0.1], idx)
+    haven = pd.Series([0.0, -0.5, -1.0, 0.2, 0.25], idx)
+    no_cost = backtest.Policy(tc_core=0.0, tc_sleeve=0.0)
+    nav, _ = backtest.simulate(core, haven, np.array([0.0, 0.1]), idx[[2, 4]], no_cost)
+    a = metrics.full_year_returns(nav)
+    np.testing.assert_allclose(sc.implied_haven(a[0.0], a[0.1], 0.1), [-1.0, 0.5], rtol=1e-12)
 
 
 def test_breakeven_and_sweep_with_two_crash_regimes():

@@ -14,14 +14,17 @@ twins at the capped w_cap, or at w* when no weight meets the cap; robust with n/
 post-2009 or short-calendar sample; fragile when a robustness check fails; not cost-effective when the
 bootstrap median is not positive; a cash sleeve is not, its bootstrap columns n/a; short or crash-free
 histories are insufficient; relever funding is labelled, raises gross exposure and refuses a grid
-above 1/3; option re-runs, the roll-offset skip for hold-to-expiry overlays and px reaching them; the
-put preset's shock and bleed at its own weight; the option sleeve's coverage marked daily; the 60/40
-benchmark from px, skipped on an empty AGG column; the index launch and bad-mark notes), the
-robustness helpers on hand-built years (the best crash year of two, the crash edge), the calm-year
-bleed, the critic's stand-alone view (excess returns over cash), the net return on premium (the third
-denominator, hand values), ranking, the Universa known-answer table and the -20% one-month shock P&L
-(its formula through the option_sleeve seam; the calm state from mkt's last year; the addendum's figure
-at the 2026-10-08 inputs, within 4 points and pinned; the fixture's values pinned).
+above 1/3 (funded_frontier: carve-out is backtest.frontier, relever levers the core per w); option
+re-runs, the roll-offset skip for hold-to-expiry overlays and px reaching them; the put preset's
+shock and bleed at its own weight; the option sleeve's coverage marked daily; the 60/40 benchmark
+from px, skipped on an empty AGG column; the index launch and bad-mark notes), the robustness
+helpers on hand-built years (the best crash year of two, the crash edge), the calm-year bleed, the
+critic's stand-alone view (excess returns over cash), the net return on premium (the third
+denominator, hand values: a purchase on the first row, on an ordinary day after a move, and on a
+rebalance date at the refilled unit capital, after a payoff or a wipe-out), ranking, the Universa
+known-answer table and the -20% one-month shock P&L (its formula through the option_sleeve seam;
+the calm state from mkt's last year; the addendum's figure at the 2026-10-08 inputs, within 4
+points and pinned; the fixture's values pinned).
 
 Why: the Candidates page and the case study read every verdict from here, so each rule is pinned on
 inputs whose answer is known by construction. Synthetic series plus the committed fixture, no I/O.
@@ -48,7 +51,7 @@ KEYS = {"candidate", "archetype", "kind", "model_priced", "funding", "sample_sta
         "maxdd_star", "calmar_star", "worst_year_star", "d_cagr_vs_dd_matched_cash_bp", "dd_gap_vs_cagr_matched_cash",
         "beats_deleverage", "p_beat_10y", "rolling10_win_rate", "crash_payoff_mean", "calm_year_bleed",
         "avg_premium_yr", "avg_coverage", "critic_sleeve_cagr", "critic_sleeve_sharpe", "critic_alpha", "critic_beta",
-        "verdict", "notes", "_table", "_nav", "bench_spxtr_cagr", "bench_spxtr_maxdd", "bench_6040_cagr",
+        "verdict", "notes", "_table", "_nav", "_cash", "bench_spxtr_cagr", "bench_spxtr_maxdd", "bench_6040_cagr",
         "bench_6040_maxdd"}
 ANNUAL = pd.to_datetime(["2018-12-31", "2019-12-31"])  # the fixture's year-ends
 TOY = Candidate("toy", "Toy haven", "insurance", "series", w_grid=(0.02, 0.05, 0.1), rebalance="annual", note="test")
@@ -264,7 +267,7 @@ def test_evaluate_dominant_insurance_is_cost_effective():
     assert row["d_cagr_vs_dd_matched_cash_bp"] == pytest.approx(1e4 * backtest.dd_matched_cash_gap(t, cash_table, w))
     assert row["cagr_star"] > cash_table["cagr"].max() and np.isnan(row["dd_gap_vs_cagr_matched_cash"])
     # attribution: crash-bin and other years add up to the mean full-year difference; the crash years pay
-    a = scenarios.full_year_returns(nav[[0.0, w]])
+    a = metrics.full_year_returns(nav[[0.0, w]])
     assert row["attr_crash_bp"] + row["attr_noncrash_bp"] == pytest.approx(1e4 * (a[w] - a[0.0]).mean(), rel=1e-12)
     assert row["attr_crash_bp"] > 0
     crash = [k for k in t.columns if k.startswith("crash:")]
@@ -410,6 +413,20 @@ def test_evaluate_relever_is_labelled_and_raises_exposure():
         catalog.evaluate(TOY, core, _dominant(core), mkt.index[:0], mkt, funding="overlay")
     with pytest.raises(ValueError, match="relever"):  # sixty_forty's (0.4,): no weight left to test
         catalog.evaluate(replace(TOY, w_grid=(0.4,)), core, _dominant(core), mkt.index[:0], mkt, funding="relever")
+
+
+def test_funded_frontier_carve_out_and_relever():
+    mkt, core = _history("2015-01-01")
+    sleeve, reb, grid = _dominant(core), catalog.rebalance_calendar(mkt.index, "annual"), np.array([0.0, 0.1, 0.25])
+    table, nav = catalog.funded_frontier(core, sleeve, grid, reb, backtest.Policy(), "carve_out", mkt["rf"])
+    ref, ref_nav = backtest.frontier(core, sleeve, grid, reb)
+    pd.testing.assert_frame_equal(table, ref)
+    pd.testing.assert_frame_equal(nav, ref_nav)
+    table, nav = catalog.funded_frontier(core, sleeve, grid, reb, backtest.Policy(), "relever", mkt["rf"])
+    assert table.index.tolist() == [0.0, 0.1, 0.25]
+    np.testing.assert_allclose(nav[0.0], ref_nav[0.0], rtol=1e-12)  # L = 1 at w = 0: the core itself
+    lev, _ = backtest.simulate(catalog.portfolio.lever(core, mkt["rf"], 1 / 0.75), sleeve, 0.25, reb)
+    np.testing.assert_allclose(nav[0.25], lev[0.25], rtol=1e-12)  # the core levered to 1 / (1 - w), per w
 
 
 def test_evaluate_reruns_option_sleeves_for_the_robustness_checks(monkeypatch):
@@ -604,6 +621,21 @@ def test_return_on_premium_hand_values():
     assert np.isnan(catalog.return_on_premium(r, rf0, none))  # nothing spent
     r.attrs = {}
     assert np.isnan(catalog.return_on_premium(r, rf0, none))  # not an option sleeve
+
+
+def test_return_on_premium_counts_row_zero_and_rebalance_day_purchases():
+    idx = pd.date_range("2019-01-01", periods=5)
+    rf0, reb = pd.Series(0.0, idx), idx[[2]]
+    # row 0 buys 0.1 of NAV 1; day 1 that put is worth 0.3 (+20%) and day 1 buys 0.1 of the 1.2 (0.12: growth
+    # through day 1, not day 0); day 2 (the rebalance) both expire worthless (NAV 0.78) and it buys 0.1, but of the
+    # refilled unit capital; day 4 that put is worth 0.5: (-0.22 + 0.4) on (0.1 + 0.12 + 0.1)
+    r = pd.Series([0.0, 0.2, 0.78 / 1.2 - 1, 0.0, 0.4], idx)
+    r.attrs = {"premium_paid": pd.Series([0.1, 0.1, 0.1, 0.0, 0.0], idx)}
+    assert catalog.return_on_premium(r, rf0, reb) == pytest.approx(0.18 / 0.32, rel=1e-12)
+    # a wipe-out on the rebalance day: the restart's premium (all of the refilled unit) still counts, -1 then +2
+    r = pd.Series([0.0, 0.0, -1.0, 2.0, 0.0], idx)
+    r.attrs = {"premium_paid": pd.Series([1.0, 0.0, 1.0, 0.0, 0.0], idx)}
+    assert catalog.return_on_premium(r, rf0, reb) == pytest.approx(0.5, rel=1e-12)
 
 
 def test_rank_orders_tiers_then_dcagr_and_drops_private_keys():

@@ -1,10 +1,11 @@
 """Tests for insureport.metrics: NAV from returns, CAGR on calendar days, annualized volatility,
 calendar-year returns, the volatility tax (the +50% / -50% example and the two-point lognormal
-closed form against its variance / 2 approximation), drawdown, time under water and the longest
-recovery span, OLS beta and downside beta, the crash-window library and its fast / slow tags,
-crash-window returns (end over start, off-calendar boundaries, sparse NAVs), concentration, hedge
-notional, and diagnose() on the 2018-2019 fixture panel (every value wired to its function, p.value,
-the window shared with the S&P 500).
+closed form against its variance / 2 approximation; on full calendar years only, a 10%-a-year line
+keeps its 10% mean), drawdown, time under water and the longest recovery span, OLS beta and downside
+beta, the crash-window library and its fast / slow tags, crash-window returns (end over start,
+off-calendar boundaries, sparse NAVs), concentration, hedge notional, and diagnose() on the 2018-2019
+fixture panel (every value wired to its function, the volatility tax on full years, p.value, the
+window shared with the S&P 500).
 
 Why: these are the numbers the Diagnostics page shows and the backtest frontier reuses, so each
 is pinned to a hand-checkable literal. Synthetic inputs plus the committed fixture CSV.
@@ -69,6 +70,18 @@ def test_vol_tax_plus_minus_fifty():
     assert vt["approx"] == pytest.approx(0.125, abs=1e-15)  # var([0.5, -0.5]) / 2
     nav = _nav_from_annual([0.5, -0.5])
     np.testing.assert_allclose(metrics.vol_tax(pd.DataFrame({"a": nav, "b": nav}))["tax"], [0.133975] * 2, atol=1e-6)
+
+
+def test_vol_tax_full_years_drops_partial_years():
+    idx = pd.date_range("2010-09-09", "2026-10-09")  # calendar days: a zero-volatility 10% a year
+    nav = pd.Series(1.1 ** ((idx - idx[0]).days / 365.25), idx)
+    assert metrics.cagr(nav) == pytest.approx(0.10, rel=1e-12)
+    assert metrics.full_year_returns(nav).index.tolist() == list(range(2011, 2026))
+    part, full = metrics.vol_tax(nav), metrics.vol_tax(nav, full_years=True)
+    assert part["arith"] < 0.095  # the partial 2010 and 2026 count as years and pull the mean below the CAGR
+    assert full["arith"] == pytest.approx(0.10, abs=2e-4) and 0 <= full["tax"] < 1e-7
+    short = metrics.vol_tax(nav.loc[:"2011-06-30"], full_years=True)  # no full calendar year
+    assert np.isnan(short["arith"]) and np.isnan(short["geo"]) and np.isnan(short["tax"])
 
 
 def test_vol_tax_two_point_lognormal():
@@ -169,7 +182,7 @@ def test_diagnose_on_fixture():
     assert d["max_dd"] == pytest.approx(metrics.max_drawdown(nav), rel=1e-12)
     assert d["tuw"] == metrics.time_under_water(nav) > 0
     assert d["longest_recovery_days"] == metrics.longest_recovery_days(nav) > 0
-    assert d["vol_tax_approx"] == pytest.approx(metrics.vol_tax(nav)["approx"], rel=1e-12)
+    assert d["vol_tax_approx"] == pytest.approx(metrics.vol_tax(nav, full_years=True)["approx"], rel=1e-12)
     assert d["crashes"].index.tolist() == ["2018 Q4"]
     spx_q4 = mkt.loc["2018-12-24", "spxtr"] / mkt.loc["2018-09-20", "spxtr"] - 1  # bench = SPX total return
     assert d["crashes"].loc["2018 Q4", "bench_ret"] == pytest.approx(spx_q4, rel=1e-12)
@@ -177,7 +190,9 @@ def test_diagnose_on_fixture():
     assert d["spx_cagr"] == pytest.approx(metrics.cagr(mkt["spxtr"]), rel=1e-12)
     assert d["spx_max_dd"] == pytest.approx(metrics.max_drawdown(mkt["spxtr"]), rel=1e-12)
     assert (d["hhi"], d["eff_n"], d["top1"], d["top5"]) == (1.0, 1.0, 1.0, 1.0)  # CASH excluded
-    assert d["vol_tax"] == pytest.approx(d["arith"] - metrics.vol_tax(metrics.nav_from_returns(core))["geo"])
+    full = metrics.vol_tax(nav, full_years=True)  # 2019 alone: 2018 starts on the panel's first row
+    assert d["arith"] == pytest.approx(full["arith"]) and d["vol_tax"] == pytest.approx(full["tax"], abs=1e-15)
+    assert d["arith"] == pytest.approx(nav["2019-12-31"] / nav["2018-12-31"] - 1, rel=1e-12)
     assert d["ann_vol"] == pytest.approx(metrics.ann_vol(core.iloc[1:]))
     n, spx = 0.8e6, mkt["spx"].iloc[-1]  # value None -> $1M, times downside beta 0.8, at the last SPX
     hedge = {"notional": n, "spx_contracts": n / (100 * spx), "xsp_contracts": n / (10 * spx)}

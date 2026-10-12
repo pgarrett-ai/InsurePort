@@ -6,7 +6,9 @@ drifts with the two daily return series and goes back to (1 - w, w) on calendar 
 option sleeve's `event` dates) or when the sleeve share leaves a relative band, paying
 proportional costs on the flows. The frontier table holds the metrics.py statistics per w;
 best_allocation is the empirical Kelly choice under a drawdown cap; the cash-matched functions
-compare a sleeve with holding less equity (the T-bill frontier, AQR's test).
+compare a sleeve with holding less equity (the T-bill frontier, AQR's test); rolling_excess and
+subperiods are the rolling-window and decade robustness views, tornado_rows reduces a one-at-a-time
+sensitivity sweep to tornado bars.
 
 Pure numpy/pandas, no I/O. Returns are daily simple returns on a DatetimeIndex; NAV frames have
 one column per w, labelled by the w value; frontier tables are indexed by w.
@@ -208,6 +210,33 @@ def rolling_excess(nav: pd.DataFrame, years: int = 10) -> pd.DataFrame:
     days = nav.index.to_series().diff(n).dt.days
     g = (nav / nav.shift(n)).pow(365.25 / days, axis=0) - 1
     return g.sub(g[0.0], axis=0)
+
+
+def subperiods(nav: pd.DataFrame, w: float, years: int = 10) -> pd.DataFrame:
+    """CAGR of the NAV columns 0.0 and w over calendar blocks of `years` (decades by default: 1990-1999,
+    ...), each block chained from the previous block's last NAV so the return across the boundary counts.
+    Rows indexed by the block's first year: cagr_0, cagr_w and d_cagr = cagr_w - cagr_0 (metrics.cagr,
+    calendar days); a block with a single NAV row (the sample's first) is left out."""
+    block = nav.index.year // years * years
+    rows = {}
+    for b in np.unique(block):
+        i = np.flatnonzero(block == b)
+        if i[-1] == 0:  # the sample's first row alone: no return to measure
+            continue
+        g = metrics.cagr(nav[[0.0, w]].iloc[max(i[0] - 1, 0) : i[-1] + 1])
+        rows[int(b)] = {"cagr_0": g[0.0], "cagr_w": g[w], "d_cagr": g[w] - g[0.0]}
+    out = pd.DataFrame.from_dict(rows, orient="index", columns=["cagr_0", "cagr_w", "d_cagr"])
+    return out.rename_axis("start_year")
+
+
+def tornado_rows(sweep: pd.DataFrame, col: str, base: float) -> pd.DataFrame:
+    """A one-at-a-time sensitivity sweep reduced to tornado bars: sweep has one row per variant (columns
+    parameter, setting and col); per parameter, in first-seen order, low / high = the smallest / largest col
+    over its settings minus base, indexed "<setting of the low> .. <setting of the high>" (first row on ties)."""
+    g = sweep.groupby("parameter", sort=False)[col]
+    lo, hi = sweep.loc[g.idxmin()], sweep.loc[g.idxmax()]
+    return pd.DataFrame({"low": lo[col].to_numpy(float) - base, "high": hi[col].to_numpy(float) - base},
+                        index=[f"{a} .. {b}" for a, b in zip(lo["setting"], hi["setting"])])
 
 
 def period_returns(r: pd.Series | pd.DataFrame, period_ends: pd.DatetimeIndex) -> pd.DataFrame:

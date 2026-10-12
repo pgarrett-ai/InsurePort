@@ -8,8 +8,9 @@ transaction costs on the rebalance flows with turnover and cost drag), the Kelly
 wired to metrics.py (crash windows incl. ones touching the sample edges, calmar NaN at zero
 drawdown), best_allocation under a drawdown cap, the drawdown-matched and CAGR-matched
 comparisons with the T-bill frontier (raw grid values find their rounded labels; the
-deleverage twin on a humped frontier), rolling excess CAGR, period compounding and the
-9,000-day x 41-point speed budget.
+deleverage twin on a humped frontier), rolling excess CAGR, decade subperiods (each chained from
+the previous decade's last NAV), the sensitivity sweep's tornado rows (lowest / highest per parameter
+minus the base, labelled by their settings), period compounding and the 9,000-day x 41-point speed budget.
 
 Why: every frontier, verdict and robustness panel runs through this engine, so each rule is
 pinned to a hand-checkable number. Small synthetic series with explicit dates, no I/O.
@@ -279,6 +280,27 @@ def test_rolling_excess_constant_gap():
     assert ex[0.0].iloc[252:].eq(0).all()
     ex2 = backtest.rolling_excess(nav, years=2)  # the window scales with years: 504 returns
     assert ex2.iloc[:504].isna().all().all() and ex2.iloc[504:].notna().all().all()
+
+
+def test_subperiods_chain_each_decade_from_the_last():
+    idx = pd.to_datetime(["2009-06-30", "2009-12-31", "2019-12-31", "2020-12-31"])
+    nav = pd.DataFrame({0.0: [1.0, 1.1, 2.2, 2.2], 0.05: [1.0, 1.0, 3.0, 2.7]}, idx)
+    out = backtest.subperiods(nav, 0.05)
+    assert out.index.tolist() == [2000, 2010, 2020] and list(out.columns) == ["cagr_0", "cagr_w", "d_cagr"]
+    # the 2010s run from the 2009 year-end NAV (chained), not from their own first row
+    t = (idx[2] - idx[1]).days / 365.25
+    np.testing.assert_allclose(out.loc[2010, ["cagr_0", "cagr_w"]], [2 ** (1 / t) - 1, 3 ** (1 / t) - 1], rtol=1e-12)
+    np.testing.assert_allclose(out.loc[2020, ["cagr_0", "cagr_w"]], [0.0, 0.9 ** (365.25 / 366) - 1], atol=1e-15)
+    assert out.loc[2000, "d_cagr"] == pytest.approx(1 - 1.1 ** (365.25 / 184), rel=1e-12)  # flat w vs 1.1x
+    assert backtest.subperiods(nav.iloc[1:], 0.05).index.tolist() == [2010, 2020]  # a lone first row: no 2000s
+
+
+def test_tornado_rows_take_each_parameters_extremes_minus_the_base():
+    sweep = pd.DataFrame({"parameter": ["m", "m", "m", "h", "h"], "d": [-10.0, 5.0, 3.0, 2.0, 2.0],
+                          "setting": ["m x0.5", "m x1.5", "m x2", "h 0", "h 0.1"]})
+    out = backtest.tornado_rows(sweep, "d", base=1.0)
+    assert out.index.tolist() == ["m x0.5 .. m x1.5", "h 0 .. h 0"]  # first-seen order; a tie takes the first row
+    np.testing.assert_array_equal(out.to_numpy(), [[-11.0, 4.0], [1.0, 1.0]])
 
 
 def test_speed_9000_days_41_points():

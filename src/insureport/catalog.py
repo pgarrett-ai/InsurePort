@@ -15,7 +15,8 @@ the AQR twins are compared. DEFERRED: the addendum's catalog comparison mode, eq
 haven at the smallest w reaching a common 5th-percentile 25-year CAGR, "cannot reach target" otherwise).
 
 Denominator discipline (addendum D13): sleeve P&L is reported in portfolio points (the hedged minus
-the unhedged portfolio), never as a return on premium. Universa / Spitznagel figures carry
+the unhedged portfolio), never headlined as a return on premium (return_on_premium, the third
+denominator, is for display next to its base). Universa / Spitznagel figures carry
 UNIVERSA_LABEL (D15). The TAIL proxy and the Universa / TAIL known-answer checks live here rather than
 in replicate.py: they are catalog presets read through build_sleeve and evaluate, while replicate.py
 validates the pricer against Cboe's indices. Benchmarks on every evaluate row (D7): the S&P 500 TR and
@@ -404,12 +405,13 @@ def suggest(diag: dict) -> list[tuple[str, str]]:
     return [(k, "; ".join(v)) for k, v in reasons.items()]
 
 
-def _frontier(
+def funded_frontier(
     core_r: pd.Series, sleeve_r: pd.Series, grid: np.ndarray, rebalance: pd.DatetimeIndex, policy: Policy,
     funding: str, rf: pd.Series,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """backtest.frontier over the grid (crash windows metrics.CRASHES, read at call time); "relever": one
-    run per w on the core levered to L = 1 / (1 - w) (portfolio.lever, rf + 50 bp), so (1 - w) L = 1 keeps
+    """The frontier table and NAV frame over the grid under a funding mode, as evaluate runs it: "carve_out" is
+    backtest.frontier ((1 - w) core + w sleeve; crash windows metrics.CRASHES, read at call time); "relever" is
+    one run per w on the core levered to L = 1 / (1 - w) (portfolio.lever, rf + 50 bp), so (1 - w) L = 1 keeps
     equity at 100% and the sleeve is financed on top."""
     if funding == "carve_out":
         return backtest.frontier(core_r, sleeve_r, grid, rebalance, policy, metrics.CRASHES)
@@ -435,9 +437,9 @@ def _sleeve_share(nav_w: pd.Series, sleeve_r: pd.Series, rebalance: pd.DatetimeI
 
 def calm_year_bleed(nav_w: pd.Series, nav_0: pd.Series, spx_annual: pd.Series) -> float:
     """Mean of the calendar-year return difference ret_w - ret_0 over the full calendar years
-    (scenarios.full_year_returns) whose S&P 500 return (spx_annual, by year) is above -15% (outside the
+    (metrics.full_year_returns) whose S&P 500 return (spx_annual, by year) is above -15% (outside the
     crash bin): negative = the hedge's cost when no crash comes, in portfolio points. NaN without one."""
-    a = scenarios.full_year_returns(pd.concat([nav_w, nav_0], axis=1, keys=["w", "u"]).dropna())
+    a = metrics.full_year_returns(pd.concat([nav_w, nav_0], axis=1, keys=["w", "u"]).dropna())
     calm = spx_annual.reindex(a.index) > scenarios.REGIME_EDGES[1]
     return float((a["w"] - a["u"])[calm.to_numpy()].mean())
 
@@ -465,6 +467,32 @@ def critic_view(sleeve_r: pd.Series, spxtr_r: pd.Series, rf: pd.Series) -> dict:
         "alpha": float((y.mean() - beta * x.mean()) * 252),
         "beta": beta,
     }
+
+
+def return_on_premium(sleeve_r: pd.Series, rf: pd.Series, rebalance: pd.DatetimeIndex) -> float:
+    """A premium-mode option sleeve's net option P&L per dollar of premium, the third denominator (D13: shown next
+    to its base, never as the headline), with the sleeve refilled to unit capital at each portfolio rebalance as
+    the engine refills it. Per period between rebalance dates (rows grouped as backtest.period_returns groups
+    them; the placeholder first row's return skipped, its purchase kept): P&L = the sleeve's growth over the period
+    minus T-bills' (cash_returns of rf carried onto its dates), premium = build_sleeve's premium_paid attrs (a
+    fraction of the NAV at the time) x the sleeve's growth since the period start, except on a period's last row (a
+    rebalance date), whose purchase is made with the refilled unit capital of the next period (x 1, after a
+    wipe-out too); the result is the summed P&L over the summed premium. -1 = every premium dollar lost, 0 =
+    break-even. NaN without premium_paid attrs or premium spent. Not for overlays: their excess return includes the
+    core they hold."""
+    paid = sleeve_r.attrs.get("premium_paid")
+    if paid is None or not paid.sum() > 0:
+        return np.nan
+    s = sleeve_r.copy()
+    s.attrs = {}
+    s.iloc[0] = 0.0  # the placeholder: NAV 1 on the first row, which can still buy (month-start rolls)
+    cash = cash_returns(rf.reindex(s.index).ffill())
+    period = pd.DatetimeIndex(rebalance).sort_values().searchsorted(s.index)
+    end = np.r_[period[1:] != period[:-1], False]  # a period's last row: the engine refills the sleeve after it
+    growth = (1 + s).groupby(period).cumprod()  # the sleeve's NAV per unit of period-start capital
+    pnl = growth.groupby(period).last() - (1 + cash).groupby(period).prod()
+    spent = paid.reindex(s.index).fillna(0.0) * np.where(end, 1.0, growth)
+    return float(pnl.sum() / spent.sum())
 
 
 def shock_pnl(
@@ -526,8 +554,8 @@ def universa_checks(nav_3_33: pd.Series, spxtr: pd.Series) -> pd.DataFrame:
 def tail_checks(proxy_r: pd.Series) -> pd.DataFrame:
     """The TAIL proxy's calendar-year returns against Cambria TAIL's reported NAV returns (TAIL_CALENDAR;
     informational): columns year, tail_reported, ours, gap = ours - tail_reported; NaN for a year the
-    proxy does not cover in full (scenarios.full_year_returns)."""
-    ours = scenarios.full_year_returns(metrics.nav_from_returns(proxy_r.dropna())).reindex(list(TAIL_CALENDAR))
+    proxy does not cover in full (metrics.full_year_returns)."""
+    ours = metrics.full_year_returns(metrics.nav_from_returns(proxy_r.dropna())).reindex(list(TAIL_CALENDAR))
     return pd.DataFrame([{"year": y, "tail_reported": v, "ours": ours[y], "gap": ours[y] - v}
                          for y, v in TAIL_CALENDAR.items()])
 
@@ -623,9 +651,10 @@ def evaluate(
       when the base is 3; model-priced only). "cost-effective (robust)" when every check passes (n/a
       ones skipped), "cost-effective (fragile)" when one fails, else "not cost-effective"; robustness
       names each check's pass / fail / n/a ("not run" otherwise); notes collects the run's caveats.
-    Plus _table (the frontier) and _nav (its NAV frame), which rank drops. beta_down None: the core's
-    downside beta to the S&P 500 (only overlay rebuilds use it). Raises ValueError for an unknown funding,
-    or for the TAIL proxy without its source (DGS10) in px (its rebuilds need it).
+    Plus _table (the frontier), _nav (its NAV frame) and _cash (the T-bill frontier table), which rank
+    drops. beta_down None: the core's downside beta to the S&P 500 (only overlay rebuilds use it). Raises
+    ValueError for an unknown funding, or for the TAIL proxy without its source (DGS10) in px (its rebuilds
+    need it).
     """
     if funding not in ("carve_out", "relever"):
         raise ValueError(f"funding must be 'carve_out' or 'relever', got {funding!r}")
@@ -643,7 +672,7 @@ def evaluate(
                              f"{c.w_grid}")
         if len(cut):
             notes.append("relever: grid weights above 1/3 dropped (" + ", ".join(f"{w:g}" for w in cut) + ")")
-    table, nav = _frontier(core_r, sleeve_r, grid, rebalance, policy, funding, mkt["rf"])
+    table, nav = funded_frontier(core_r, sleeve_r, grid, rebalance, policy, funding, mkt["rf"])
     start, end = nav.index[0], nav.index[-1]
     years = (end - start).days / 365.25
     w_star, w_cap = backtest.best_allocation(table, None), backtest.best_allocation(table, dd_cap)
@@ -678,7 +707,7 @@ def evaluate(
         notes.append("60/40 benchmark not run: pass AGG in px (and DGS10 when the sample starts before AGG)")
 
     pair = pd.DataFrame({"u": nav[0.0], "h": nav[w_star]})
-    ann = scenarios.full_year_returns(pair)
+    ann = metrics.full_year_returns(pair)
     p_beat = win10 = np.nan  # w* = 0 tests nothing: n/a, not "never beats"
     if w_star > 0:
         per = backtest.period_returns(pair.pct_change().iloc[1:], rebalance)
@@ -709,7 +738,7 @@ def evaluate(
     if "premium_paid" in extra:
         prem = float((extra["premium_paid"].reindex(nav.index).fillna(0.0) * share).sum() / years)
         cov = float((extra["coverage"].reindex(nav.index).ffill().fillna(0.0) * share).mean())
-    a = scenarios.full_year_returns(pair_s)
+    a = metrics.full_year_returns(pair_s)
     diff = (a["h"] - a["u"])[a.index.isin(spx_annual.index)]
     in_crash = (spx_annual.reindex(diff.index) <= scenarios.REGIME_EDGES[1]).to_numpy()
     w_p = W_UNIVERSA if W_UNIVERSA in table.index else w_s  # BLEED_WARN and the addendum's shock are at 3.33%
@@ -749,7 +778,7 @@ def evaluate(
             def rebuilt(**over: float) -> bool:
                 s, cal = build_sleeve(c, mkt, px, core_r, beta, pricing_kw=(pricing_kw or {}) | over, chain=chain)
                 s.attrs = {}
-                t, _ = _frontier(core_r, s, np.array([0.0, w_star]), cal, policy, funding, mkt["rf"])
+                t, _ = funded_frontier(core_r, s, np.array([0.0, w_star]), cal, policy, funding, mkt["rf"])
                 return bool(t.at[w_star, "cagr"] > t.at[0.0, "cagr"])
 
             checks["roll_offsets"] = (all(rebuilt(offset_bdays=k) for k in OFFSETS) if _sold_before_expiry(c.spec)
@@ -792,7 +821,7 @@ def evaluate(
         "critic_beta": critic["beta"], "verdict": verdict,
         "robustness": ", ".join(f"{k} {'n/a' if v is None else 'pass' if v else 'fail'}" for k, v in checks.items())
         or "not run",
-        "notes": "; ".join(notes), "_table": table, "_nav": nav,
+        "notes": "; ".join(notes), "_table": table, "_nav": nav, "_cash": cash_table,
     }
 
 

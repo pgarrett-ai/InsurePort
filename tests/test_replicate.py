@@ -8,7 +8,8 @@ settlement at the open, which alone moves roll days only; no open values, no Cbo
 1990-2015 fill cost per option per roll (both bounds of the window; an ask FILL_ADD over a non-zero
 mid), the smile and convention knobs reaching the replica and the table, validate passing conventions
 and fill on and calibrate_skew running on replicate's Cboe defaults, the validation table (its pass flags, the run
-settings, the CLL bad-mark flag), a neutralised splice and too-short windows, a regression pin of
+settings, the CLL bad-mark flag), a neutralised splice (unsplice's hand values: the levels from the
+splice on rescaled) and too-short windows, a regression pin of
 PPUT tracking at the pricer's defaults (SKEW_MULT 1 on the anchored slope, SKEW_BETA 0.5; TE bound only,
 slice 5's |dCAGR| <= 1%/yr bound breached and recorded there), the calibration grid (its default m grid;
 smallest |dCAGR|, ties to the lower TE; slope-cap share; nothing after train_end used) and unknown
@@ -288,6 +289,21 @@ def test_validate_neutralises_a_splice(monkeypatch):
     pd.testing.assert_frame_equal(replicate.validate(stepped, windows=w), replicate.validate(MKT, windows=w))
     monkeypatch.delitem(replicate.SPLICES, "CLL")  # unhandled, the step is a tracking error
     assert replicate.validate(stepped, windows=w).at["CLL", "te"] > replicate.validate(MKT, windows=w).at["CLL", "te"]
+
+
+def test_unsplice_rescales_from_the_splice_on(monkeypatch):
+    idx = pd.bdate_range("2019-06-03", periods=4)
+    actual = pd.Series([100.0, 101.0, 80.0, 82.0], idx)  # a -20.8% file break on the third day
+    synth = pd.Series([100.0, 101.0, 100.0, 102.0], idx)  # the replica: -0.99% that day
+    monkeypatch.setitem(replicate.SPLICES, "CLL", "2019-06-05")
+    out = replicate.unsplice(actual, synth, "CLL")
+    k = (80 / 101) / (100 / 101)  # 0.8: actual's splice-day return over the replica's
+    np.testing.assert_allclose(out, [100, 101, 80 / k, 82 / k], rtol=1e-12)  # 100, 101, 100, 102.5
+    assert out.iloc[2] / out.iloc[1] == pytest.approx(synth.iloc[2] / synth.iloc[1])
+    assert replicate.unsplice(actual, synth, "PPUT") is actual  # no splice
+    assert replicate.unsplice(actual, synth.where(idx > idx[1]), "CLL") is actual  # no replica level before it
+    monkeypatch.setitem(replicate.SPLICES, "CLL", "2019-06-03")
+    assert replicate.unsplice(actual, synth, "CLL") is actual  # the first row: no return to neutralise
 
 
 def test_pput_tracking_regression_pin():

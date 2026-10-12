@@ -65,16 +65,26 @@ def annual_returns(nav: pd.Series | pd.DataFrame) -> pd.Series | pd.DataFrame:
     return out.iloc[1:] if (nav.index.year == nav.index[0].year).sum() == 1 else out
 
 
-def vol_tax(nav: pd.Series | pd.DataFrame) -> dict:
-    """Volatility tax on the calendar-year returns R_1..R_n of `nav` (annual_returns).
+def full_year_returns(nav: pd.Series | pd.DataFrame) -> pd.Series | pd.DataFrame:
+    """annual_returns(nav) for full calendar years only: the first year is dropped (the NAV starts inside
+    it, so its return is measured from the first NAV), the last when the NAV ends before that year's last
+    business day (Mon-Fri, so a calendar month-end NAV ending on a weekend Dec 31 keeps it). Per column."""
+    a = annual_returns(nav)
+    first, last = nav.index[0], nav.index[-1]
+    return a[(a.index > first.year) & ((a.index < last.year) | ((last + pd.offsets.BDay()).year > last.year))]
+
+
+def vol_tax(nav: pd.Series | pd.DataFrame, full_years: bool = False) -> dict:
+    """Volatility tax on the calendar-year returns R_1..R_n of `nav` (annual_returns; full_year_returns
+    when full_years, so a partial first or last year cannot pull the mean below the CAGR).
 
     arith = mean(R), geo = (prod(1 + R))^(1/n) - 1, tax = arith - geo, approx = var(R, ddof=0) / 2
-    (the second-order estimate of the tax). Values are Series for a DataFrame.
+    (the second-order estimate of the tax). Values are Series for a DataFrame; NaN with no year.
     """
-    # ponytail: partial first/last years count as full years; trim to whole years if short samples mislead
-    a = annual_returns(nav)
+    # ponytail: full_years False (the frontier's arith_mean / vol_tax) counts partial first/last years as years
+    a = full_year_returns(nav) if full_years else annual_returns(nav)
     arith = a.mean()
-    geo = (1 + a).prod() ** (1 / len(a)) - 1
+    geo = (1 + a).prod() ** (1 / len(a)) - 1 if len(a) else arith
     return {"arith": arith, "geo": geo, "tax": arith - geo, "approx": a.var(ddof=0) / 2}
 
 
@@ -183,8 +193,9 @@ def diagnose(core_r: pd.Series, spxtr_r: pd.Series, p: Portfolio, mkt: pd.DataFr
     """Every diagnostic of the core return series in one flat dict.
 
     Keys: start, end, years (calendar days / 365.25), cagr, arith / vol_tax / vol_tax_approx
-    (vol_tax's arith / tax / approx), ann_vol, max_dd, tuw, longest_recovery_days, beta,
-    downside_beta (vs spxtr_r), hhi, eff_n, top1, top5 (concentration of p.weights), spx_cagr,
+    (vol_tax's arith / tax / approx over the full calendar years; NaN with none), ann_vol, max_dd, tuw,
+    longest_recovery_days, beta, downside_beta (vs spxtr_r), hhi, eff_n, top1, top5 (concentration of
+    p.weights), spx_cagr,
     spx_max_dd (S&P 500 total return over the core's sample), crashes (crash_returns with the
     S&P 500 total-return NAV as bench) and hedge (hedge_notional on p.value, or $1,000,000 when
     it is None, at the last mkt.spx). core_r's first row is the 0 placeholder core_returns emits,
@@ -207,7 +218,10 @@ def diagnose(core_r: pd.Series, spxtr_r: pd.Series, p: Portfolio, mkt: pd.DataFr
     start, end = nav.index[0], nav.index[-1]
     spx_nav = nav_from_returns(spxtr_r.loc[start:end])
     daily = core_r.iloc[1:]
-    vt = vol_tax(nav)
+    # DEVIATION (slice 11, an existing public API's output changed): arith / vol_tax / vol_tax_approx now cover the
+    # full calendar years only (vol_tax full_years=True; they spanned the partial first and last years before), so a
+    # partial year cannot pull the mean below the CAGR on the Diagnostics page
+    vt = vol_tax(nav, full_years=True)
     beta_down = downside_beta(daily, spxtr_r)
     return {
         "start": start,

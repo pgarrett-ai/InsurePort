@@ -127,14 +127,14 @@ def book_portfolio_returns(core_j: np.ndarray, haven_j: np.ndarray, w: np.ndarra
     return np.outer(core_j, 1 - w) + np.outer(haven_j, w)
 
 
-def full_year_returns(nav: pd.Series | pd.DataFrame) -> pd.Series | pd.DataFrame:
-    """metrics.annual_returns(nav) for full calendar years only: the first year is dropped (the NAV
-    starts inside it, so its return is measured from the first NAV), the last when the NAV ends before
-    that year's last business day (Mon-Fri, so a calendar month-end NAV ending on a weekend Dec 31
-    keeps it). Per column."""
-    a = metrics.annual_returns(nav)
-    first, last = nav.index[0], nav.index[-1]
-    return a[(a.index > first.year) & ((a.index < last.year) | ((last + pd.offsets.BDay()).year > last.year))]
+def implied_haven(core: np.ndarray | pd.Series, port: np.ndarray | pd.Series, w: float) -> np.ndarray | pd.Series:
+    """The inverse of book_portfolio_returns: the haven return h with (1 - w) core + w h = port, i.e.
+    (port - (1 - w) core) / w, elementwise (w > 0). On the engine's NAV columns 0 and w (calendar-year or
+    rebalance-period returns) it is the haven as the portfolio held it: refilled at every rebalance (a
+    -100% year does not zero the next), exact for carve-out rebalancing at those period ends at tc 0;
+    under relever funding the sleeve plus the core exposure its financing keeps, less that financing
+    (about core + sleeve - (rf + 50 bp)), so that mixing it back at w reproduces the levered portfolio."""
+    return (port - (1 - w) * core) / w
 
 
 def regime_portfolio_returns(
@@ -142,12 +142,12 @@ def regime_portfolio_returns(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Estimated mode: (p, P, n) from the calendar-year returns of each NAV column.
 
-    The years are full_year_returns(nav) that spx_annual has (non NaN). Each year goes to the
+    The years are metrics.full_year_returns(nav) that spx_annual has (non NaN). Each year goes to the
     regime of the S&P 500 return of the same year; n_j counts them, p_j = n_j / sum n,
     P (J x n_w) is the mean NAV-column return per regime, a NaN row where n_j = 0. Raises
     ValueError when no full year is left.
     """
-    a = full_year_returns(nav)
+    a = metrics.full_year_returns(nav)
     spx = spx_annual.dropna()
     a = a[a.index.isin(spx.index)]
     if a.empty:
